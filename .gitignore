@@ -12,6 +12,9 @@ ENV/
 # Environment variables
 .env
 
+# Session files
+.session
+
 # IDE
 .vscode/
 .idea/
