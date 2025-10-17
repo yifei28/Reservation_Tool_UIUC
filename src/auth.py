@@ -48,15 +48,15 @@ class SessionManager:
         })
 
         # UIUC URLs
-        self.base_url = "https://campusrec.illinois.edu"
-        self.login_url = "https://login.illinois.edu"
+        self.base_url = "https://active.illinois.edu"
+        self.login_url = "https://login.microsoftonline.com"
 
     def login(self, username: str, password: str, max_retries: int = 3) -> bool:
         """
-        Authenticate with UIUC Active Illini using Shibboleth SSO.
+        Authenticate with UIUC Active Illini using Microsoft Azure AD SSO.
 
         Args:
-            username: UIUC NetID
+            username: UIUC NetID (will be formatted as NetID@illinois.edu)
             password: UIUC password
             max_retries: Maximum number of retry attempts
 
@@ -70,36 +70,57 @@ class SessionManager:
             try:
                 logger.info(f"Authentication attempt {attempt + 1}/{max_retries}")
 
-                # Step 1: Initial request to trigger SSO redirect
-                logger.debug("Initiating SSO authentication flow")
+                # Step 1: Load booking page to establish session and get CSRF token
+                logger.debug("Establishing session by loading booking page")
                 response = self.session.get(
                     f"{self.base_url}/booking",
-                    allow_redirects=False,
                     timeout=10
                 )
 
-                # Step 2: Follow redirects to login page
-                redirect_count = 0
-                while response.status_code in [301, 302, 303, 307] and redirect_count < 10:
-                    redirect_url = response.headers.get('Location')
+                # Extract CSRF token from the page
+                soup = BeautifulSoup(response.text, 'html.parser')
+                csrf_input = soup.find('input', {'name': '__RequestVerificationToken'})
+                csrf_token = csrf_input.get('value') if csrf_input else None
 
-                    # Handle relative redirects
-                    if not redirect_url.startswith('http'):
-                        parsed = urlparse(response.url)
-                        redirect_url = f"{parsed.scheme}://{parsed.netloc}{redirect_url}"
+                if not csrf_token:
+                    logger.warning("CSRF token not found, attempting without it")
+                else:
+                    logger.debug(f"Found CSRF token: {csrf_token[:20]}...")
 
-                    logger.debug(f"Following redirect to: {redirect_url}")
-                    response = self.session.get(redirect_url, allow_redirects=False, timeout=10)
-                    redirect_count += 1
+                # Step 2: POST to ExternalLogin to initiate SSO flow
+                logger.debug("Initiating SSO authentication flow")
+                post_data = {
+                    'provider': 'Shibboleth',
+                    'returnUrl': '/booking'
+                }
+                if csrf_token:
+                    post_data['__RequestVerificationToken'] = csrf_token
 
-                    # Check if we've reached the login form
-                    if 'login.illinois.edu' in response.url or 'shibboleth.illinois.edu' in response.url:
-                        break
+                response = self.session.post(
+                    f"{self.base_url}/Account/ExternalLogin",
+                    data=post_data,
+                    headers={
+                        'Referer': f"{self.base_url}/booking",
+                        'Origin': self.base_url
+                    },
+                    allow_redirects=True,
+                    timeout=30
+                )
+
+                # Step 2: We should now be at Microsoft Azure AD login page
+                logger.debug(f"Current URL after SSO initiation: {response.url}")
+
+                if 'login.microsoftonline.com' not in response.url:
+                    logger.error(f"Unexpected URL after SSO redirect: {response.url}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise AuthenticationError("Failed to reach Microsoft login page")
 
                 # Step 3: Parse login form
-                logger.debug("Parsing login form")
+                logger.debug("Parsing Microsoft Azure AD login form")
                 soup = BeautifulSoup(response.text, 'html.parser')
-                form = soup.find('form', {'id': 'fm1'}) or soup.find('form', {'name': 'loginForm'})
+                form = soup.find('form')
 
                 if not form:
                     logger.error("Login form not found in response")
@@ -114,20 +135,30 @@ class SessionManager:
                     parsed = urlparse(response.url)
                     action_url = f"{parsed.scheme}://{parsed.netloc}{action_url}"
 
+                # Format username as NetID@illinois.edu for Microsoft Azure AD
+                formatted_username = f"{username}@illinois.edu" if '@' not in username else username
+
                 # Build form data with credentials
+                # Microsoft Azure AD uses 'login' and 'passwd' fields
                 form_data = {
-                    'j_username': username,
-                    'j_password': password,
-                    '_eventId_proceed': ''
+                    'login': formatted_username,
+                    'passwd': password,
+                    'ctx': '',
+                    'hpgrequestid': '',
+                    'flowToken': '',
+                    'canary': '',
+                    'i13': '0',
+                    'LoginOptions': '3'
                 }
 
                 # Add all hidden fields from the form
                 for hidden in form.find_all('input', {'type': 'hidden'}):
                     name = hidden.get('name')
                     value = hidden.get('value', '')
-                    if name and name not in form_data:
+                    if name:
                         form_data[name] = value
 
+                logger.debug(f"Submitting as: {formatted_username}")
                 logger.debug(f"Form fields: {list(form_data.keys())}")
 
                 # Step 4: Submit credentials
@@ -154,22 +185,33 @@ class SessionManager:
                 # Step 6: Verify authentication success
                 logger.debug(f"Final URL after authentication: {response.url}")
 
-                if self.base_url in response.url or 'campusrec' in response.url:
-                    self.authenticated = True
-                    self.auth_time = time.time()
-                    logger.info("Authentication successful!")
-                    self.save_session()
-                    return True
-                else:
-                    # Check if we got an error message
-                    if 'error' in response.text.lower() or 'invalid' in response.text.lower():
+                # Check if we're back at Active Illini (successful authentication)
+                if 'active.illinois.edu' in response.url:
+                    # Additional verification: check if we can access the booking page
+                    test_response = self.session.get(
+                        f"{self.base_url}/booking",
+                        timeout=10
+                    )
+
+                    # If we don't get redirected to login, we're authenticated
+                    if 'login' not in test_response.url.lower():
+                        self.authenticated = True
+                        self.auth_time = time.time()
+                        logger.info("Authentication successful!")
+                        self.save_session()
+                        return True
+
+                # Check if we're still at login page (authentication failed)
+                if 'login.microsoftonline.com' in response.url or 'shibboleth.illinois.edu' in response.url:
+                    # Check for error messages
+                    if 'error' in response.text.lower() or 'incorrect' in response.text.lower():
                         logger.error("Authentication failed - invalid credentials")
                         raise AuthenticationError("Invalid username or password")
 
-                    logger.warning(f"Unexpected redirect after login: {response.url}")
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)
-                        continue
+                logger.warning(f"Unexpected state after login: {response.url}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Network error during authentication: {e}")
@@ -299,25 +341,29 @@ class SessionManager:
             logger.warning(f"Session validation failed: {e}")
             return False
 
-    def ensure_authenticated(self, username: str, password: str) -> None:
+    def ensure_authenticated(self, username: str = None, password: str = None) -> None:
         """
         Ensure we have a valid authenticated session.
 
-        Tries to load existing session first, then authenticates if needed.
+        Tries to load existing session first. If no valid session exists,
+        instructs user to run extract_cookies.py to manually authenticate.
 
         Args:
-            username: UIUC NetID
-            password: UIUC password
+            username: UIUC NetID (deprecated - not used)
+            password: UIUC password (deprecated - not used)
 
         Raises:
-            AuthenticationError: If authentication fails
+            AuthenticationError: If no valid session is available
         """
         # Try to load existing session
         if self.load_session():
             logger.info("Using existing authenticated session")
             return
 
-        # Need to authenticate
-        logger.info("No valid session found, authenticating...")
-        if not self.login(username, password):
-            raise AuthenticationError("Failed to establish authenticated session")
+        # No valid session - user needs to authenticate manually
+        logger.error("No valid session found")
+        raise AuthenticationError(
+            "Authentication required. Please run:\n"
+            "    python3 extract_cookies.py\n"
+            "to log in manually and extract your session cookies."
+        )

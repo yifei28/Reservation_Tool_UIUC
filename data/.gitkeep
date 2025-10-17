@@ -1,0 +1,2 @@
+# This directory stores persistent data for Docker deployment
+# Contents are ignored by git but the directory structure is tracked

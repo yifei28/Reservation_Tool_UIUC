@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Active Illini Booking</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .session-status {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            margin-top: 10px;
+        }
+
+        .session-ok {
+            background: #10b981;
+            color: white;
+        }
+
+        .session-error {
+            background: #ef4444;
+            color: white;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            font-size: 1.1em;
+            cursor: pointer;
+            border-radius: 10px;
+            transition: all 0.3s;
+        }
+
+        .tab:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        .tab.active {
+            background: white;
+            color: #667eea;
+            font-weight: bold;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #374151;
+            font-weight: 600;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 1em;
+            transition: border 0.3s;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button {
+            padding: 12px 24px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+        }
+
+        button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+
+        .slots-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        .slot-button {
+            padding: 15px;
+            background: #f3f4f6;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .slot-button:hover {
+            background: #e5e7eb;
+            border-color: #667eea;
+        }
+
+        .slot-button.selected {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+
+        .bookings-list {
+            margin-top: 20px;
+        }
+
+        .booking-item {
+            background: #f9fafb;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .booking-info {
+            flex: 1;
+        }
+
+        .booking-info strong {
+            color: #667eea;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+
+        .status-pending {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .status-success {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .status-failed {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .alert-success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 1px solid #10b981;
+        }
+
+        .alert-error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #ef4444;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+        }
+
+        /* Modal styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #667eea;
+        }
+
+        .modal-status {
+            background: #f3f4f6;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .modal-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        .modal-buttons button {
+            flex: 1;
+        }
+
+        .spinner {
+            border: 3px solid #f3f4f6;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <!-- Cookie Extraction Modal -->
+    <div id="cookie-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h3 class="modal-header">🔄 Reload Authentication Cookies</h3>
+
+            <div id="cookie-status" class="modal-status">
+                <p><strong>Status:</strong> <span id="status-text">Ready</span></p>
+                <p id="cookies-count" style="display: none;"><strong>Cookies:</strong> <span id="cookies-count-value">0</span></p>
+                <p id="current-url-display" style="display: none;"><strong>URL:</strong> <span id="current-url-value"></span></p>
+            </div>
+
+            <div id="cookie-actions">
+                <div class="modal-buttons">
+                    <button onclick="startCookieExtraction()" style="background: #10b981;">
+                        🌐 Open Login Browser
+                    </button>
+                    <button onclick="closeCookieModal()" style="background: #6b7280;">
+                        ❌ Cancel
+                    </button>
+                </div>
+            </div>
+
+            <div id="cookie-progress" style="display: none;">
+                <p style="text-align: center; margin-bottom: 10px;">Browser is open. Please log in to Active Illini.</p>
+                <p style="text-align: center; color: #6b7280; margin-bottom: 20px;">Auto-detecting login completion...</p>
+                <div class="spinner"></div>
+
+                <!-- Manual trigger button -->
+                <div class="modal-buttons">
+                    <button onclick="manualCompleteCookies()" style="background: #f59e0b;">
+                        ✅ I'm Logged In - Extract Now
+                    </button>
+                </div>
+            </div>
+
+            <div id="cookie-result" style="display: none; text-align: center;">
+                <!-- Shows success/failure message -->
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="header">
+            <h1>🏀 Active Illini Booking</h1>
+            <p>Fast automated facility reservations</p>
+            <div style="display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; margin-top: 15px;">
+                <div id="session-status" class="session-status">Checking session...</div>
+                <button onclick="openCookieModal()" style="padding: 8px 16px; border-radius: 20px; background: #f59e0b; color: white; border: none; cursor: pointer; font-weight: 500;">
+                    🔄 Reload Cookies
+                </button>
+            </div>
+            <div id="reload-result" style="margin-top: 10px;"></div>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('book')">📅 Book Now</button>
+            <button class="tab" onclick="showTab('schedule')">⏰ Schedule Booking</button>
+            <button class="tab" onclick="showTab('scheduled')">📋 My Scheduled Bookings</button>
+        </div>
+
+        <!-- Book Now Tab -->
+        <div id="book-tab" class="tab-content active">
+            <div class="card">
+                <h2>Book Immediately</h2>
+                <p style="color: #6b7280; margin-bottom: 20px;">Book an available slot right now</p>
+
+                <div class="form-group">
+                    <label>Facility</label>
+                    <select id="book-facility" onchange="loadSlots()">
+                        <option value="">Select a facility...</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Date</label>
+                    <input type="date" id="book-date" onchange="loadSlots()">
+                </div>
+
+                <div id="slots-container"></div>
+
+                <button id="book-button" onclick="bookNow()" disabled>Book Now</button>
+            </div>
+        </div>
+
+        <!-- Schedule Booking Tab -->
+        <div id="schedule-tab" class="tab-content">
+            <div class="card">
+                <h2>Schedule Automated Booking</h2>
+                <p style="color: #6b7280; margin-bottom: 20px;">Set up automatic booking at a specific time</p>
+
+                <div class="form-group">
+                    <label>Facility</label>
+                    <select id="schedule-facility">
+                        <option value="">Select a facility...</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Target Date (date you want to book)</label>
+                    <input type="date" id="schedule-date">
+                </div>
+
+                <div class="form-group">
+                    <label>Time Slot</label>
+                    <select id="schedule-time">
+                        <option value="">Select time...</option>
+                        <option value="6 - 7 AM">6 - 7 AM</option>
+                        <option value="7 AM - 8 AM">7 AM - 8 AM</option>
+                        <option value="8 AM - 9 AM">8 AM - 9 AM</option>
+                        <option value="9 AM - 10 AM">9 AM - 10 AM</option>
+                        <option value="10 AM - 11 AM">10 AM - 11 AM</option>
+                        <option value="11 AM - 12 PM">11 AM - 12 PM</option>
+                        <option value="12 - 1 PM">12 - 1 PM</option>
+                        <option value="1 - 2 PM">1 - 2 PM</option>
+                        <option value="2 - 3 PM">2 - 3 PM</option>
+                        <option value="3 - 4 PM">3 - 4 PM</option>
+                        <option value="4 - 5 PM">4 - 5 PM</option>
+                        <option value="5 - 6 PM">5 - 6 PM</option>
+                        <option value="6 - 7 PM">6 - 7 PM</option>
+                        <option value="7 - 8 PM">7 - 8 PM</option>
+                        <option value="8 - 9 PM">8 - 9 PM</option>
+                        <option value="9 - 10 PM">9 - 10 PM</option>
+                        <option value="10 - 11 PM">10 - 11 PM</option>
+                        <option value="11 PM - 12 AM">11 PM - 12 AM</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="custom-time-checkbox" onchange="toggleCustomTime()">
+                        Use custom execution time (otherwise defaults to 72 hours before)
+                    </label>
+                </div>
+
+                <div class="form-group" id="custom-time-group" style="display: none;">
+                    <label>Execute At (when to actually run the booking)</label>
+                    <input type="datetime-local" id="schedule-execute-at">
+                    <small style="color: #6b7280; display: block; margin-top: 5px;">
+                        Leave blank for default (72 hours before target date)
+                    </small>
+                </div>
+
+                <button onclick="scheduleBooking()">Schedule Booking</button>
+
+                <div id="schedule-result"></div>
+            </div>
+        </div>
+
+        <!-- Scheduled Bookings Tab -->
+        <div id="scheduled-tab" class="tab-content">
+            <div class="card">
+                <h2>Scheduled Bookings</h2>
+                <p style="color: #6b7280; margin-bottom: 20px;">Manage your automated bookings</p>
+
+                <button onclick="loadScheduledBookings()" style="margin-bottom: 20px;">🔄 Refresh</button>
+
+                <div id="scheduled-list" class="bookings-list">
+                    <div class="loading">Loading...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedSlot = null;
+
+        // Check session on load
+        async function checkSession() {
+            try {
+                const res = await fetch('/api/check-session');
+                const data = await res.json();
+                const statusEl = document.getElementById('session-status');
+
+                if (data.has_session) {
+                    statusEl.className = 'session-status session-ok';
+                    statusEl.textContent = '✓ Session Active';
+                } else {
+                    statusEl.className = 'session-status session-error';
+                    statusEl.textContent = '✗ No Session - Run extract_cookies.py';
+                }
+            } catch (e) {
+                console.error('Session check failed:', e);
+            }
+        }
+
+        // Load facilities
+        async function loadFacilities() {
+            try {
+                const res = await fetch('/api/facilities');
+                const facilities = await res.json();
+
+                const selects = ['book-facility', 'schedule-facility'];
+                selects.forEach(id => {
+                    const select = document.getElementById(id);
+                    facilities.forEach(fac => {
+                        const option = document.createElement('option');
+                        option.value = fac.id;
+                        option.textContent = fac.name;
+                        select.appendChild(option);
+                    });
+                });
+            } catch (e) {
+                console.error('Failed to load facilities:', e);
+            }
+        }
+
+        // Load available slots
+        async function loadSlots() {
+            const facility = document.getElementById('book-facility').value;
+            const date = document.getElementById('book-date').value;
+            const container = document.getElementById('slots-container');
+
+            if (!facility || !date) {
+                container.innerHTML = '';
+                return;
+            }
+
+            container.innerHTML = '<div class="loading">Loading slots...</div>';
+
+            try {
+                const res = await fetch('/api/slots', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({facility, date})
+                });
+
+                const data = await res.json();
+
+                if (data.slots && data.slots.length > 0) {
+                    container.innerHTML = '<h3>Available Slots:</h3><div class="slots-grid"></div>';
+                    const grid = container.querySelector('.slots-grid');
+
+                    data.slots.forEach(slot => {
+                        const btn = document.createElement('div');
+                        btn.className = 'slot-button';
+                        btn.innerHTML = `<strong>${slot.time_text}</strong><br><small>${slot.spots_available}</small>`;
+                        btn.onclick = () => selectSlot(slot, btn);
+                        grid.appendChild(btn);
+                    });
+                } else {
+                    container.innerHTML = '<p>No available slots for this date.</p>';
+                }
+            } catch (e) {
+                container.innerHTML = '<p class="alert-error">Failed to load slots</p>';
+            }
+        }
+
+        // Select a slot
+        function selectSlot(slot, element) {
+            selectedSlot = slot;
+            document.querySelectorAll('.slot-button').forEach(btn => btn.classList.remove('selected'));
+            element.classList.add('selected');
+            document.getElementById('book-button').disabled = false;
+        }
+
+        // Book now
+        async function bookNow() {
+            if (!selectedSlot) return;
+
+            const facility = document.getElementById('book-facility').value;
+            const date = document.getElementById('book-date').value;
+            const btn = document.getElementById('book-button');
+
+            btn.disabled = true;
+            btn.textContent = 'Booking...';
+
+            try {
+                const res = await fetch('/api/book', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        facility,
+                        date,
+                        time: selectedSlot.time_text
+                    })
+                });
+
+                const data = await res.json();
+
+                if (data.success) {
+                    alert('✅ Booking successful!');
+                    loadSlots(); // Refresh
+                } else {
+                    alert('❌ Booking failed: ' + (data.error || data.message));
+                }
+            } catch (e) {
+                alert('❌ Error: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Book Now';
+            }
+        }
+
+        // Toggle custom execution time field
+        function toggleCustomTime() {
+            const checkbox = document.getElementById('custom-time-checkbox');
+            const customTimeGroup = document.getElementById('custom-time-group');
+            customTimeGroup.style.display = checkbox.checked ? 'block' : 'none';
+        }
+
+        // Schedule booking
+        async function scheduleBooking() {
+            const facility = document.getElementById('schedule-facility').value;
+            const date = document.getElementById('schedule-date').value;
+            const time = document.getElementById('schedule-time').value;
+            const executeAt = document.getElementById('schedule-execute-at').value;
+            const resultEl = document.getElementById('schedule-result');
+
+            if (!facility || !date || !time) {
+                alert('Please fill all required fields');
+                return;
+            }
+
+            try {
+                const payload = {facility, date, time};
+
+                // Add custom execution time if provided
+                if (executeAt) {
+                    payload.execute_at = executeAt;
+                }
+
+                const res = await fetch('/api/schedule', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await res.json();
+
+                if (data.success) {
+                    resultEl.innerHTML = `<div class="alert alert-success">✅ ${data.message}</div>`;
+                } else {
+                    resultEl.innerHTML = `<div class="alert alert-error">❌ ${data.error || data.message}</div>`;
+                }
+            } catch (e) {
+                resultEl.innerHTML = `<div class="alert alert-error">❌ Error: ${e.message}</div>`;
+            }
+        }
+
+        // Load scheduled bookings
+        async function loadScheduledBookings() {
+            const listEl = document.getElementById('scheduled-list');
+            listEl.innerHTML = '<div class="loading">Loading...</div>';
+
+            try {
+                const res = await fetch('/api/scheduled-bookings');
+                const bookings = await res.json();
+
+                if (bookings.length === 0) {
+                    listEl.innerHTML = '<p>No scheduled bookings</p>';
+                    return;
+                }
+
+                listEl.innerHTML = '';
+                bookings.forEach(booking => {
+                    const item = document.createElement('div');
+                    item.className = 'booking-item';
+                    item.innerHTML = `
+                        <div class="booking-info">
+                            <strong>${booking.facility}</strong> - ${booking.slot_time}<br>
+                            <small>Target: ${booking.target_date} | Executes: ${booking.execute_at}</small><br>
+                            <small>Time until: ${booking.hours_until.toFixed(1)} hours</small>
+                            <span class="status-badge status-${booking.status}">${booking.status}</span>
+                        </div>
+                        ${booking.status === 'pending' ?
+                            `<button onclick="cancelBooking(${booking.index})">Cancel</button>` :
+                            ''}
+                    `;
+                    listEl.appendChild(item);
+                });
+            } catch (e) {
+                listEl.innerHTML = '<p class="alert-error">Failed to load bookings</p>';
+            }
+        }
+
+        // Cancel booking
+        async function cancelBooking(index) {
+            if (!confirm('Cancel this booking?')) return;
+
+            try {
+                const res = await fetch(`/api/cancel-booking/${index}`, {method: 'DELETE'});
+                const data = await res.json();
+
+                if (data.success) {
+                    loadScheduledBookings();
+                } else {
+                    alert('Failed to cancel');
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        // Cookie extraction modal and functions
+        let currentSessionId = null;
+        let pollInterval = null;
+
+        function openCookieModal() {
+            const modal = document.getElementById('cookie-modal');
+            modal.classList.add('active');
+
+            // Reset modal state
+            document.getElementById('cookie-actions').style.display = 'block';
+            document.getElementById('cookie-progress').style.display = 'none';
+            document.getElementById('cookie-result').style.display = 'none';
+            document.getElementById('status-text').textContent = 'Ready';
+            document.getElementById('cookies-count').style.display = 'none';
+            document.getElementById('current-url-display').style.display = 'none';
+        }
+
+        function closeCookieModal() {
+            const modal = document.getElementById('cookie-modal');
+            modal.classList.remove('active');
+
+            // Stop polling
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+
+            currentSessionId = null;
+        }
+
+        async function startCookieExtraction() {
+            try {
+                // Start extraction
+                const res = await fetch('/api/extract-cookies-start', {
+                    method: 'POST'
+                });
+
+                const data = await res.json();
+
+                if (!data.success) {
+                    alert('Failed to start: ' + (data.error || 'Unknown error'));
+                    return;
+                }
+
+                currentSessionId = data.session_id;
+
+                // Show progress UI
+                document.getElementById('cookie-actions').style.display = 'none';
+                document.getElementById('cookie-progress').style.display = 'block';
+                document.getElementById('status-text').textContent = 'Browser launching...';
+
+                // Start polling status
+                pollCookieStatus();
+
+            } catch (e) {
+                alert('Error starting extraction: ' + e.message);
+            }
+        }
+
+        function pollCookieStatus() {
+            pollInterval = setInterval(async () => {
+                if (!currentSessionId) {
+                    clearInterval(pollInterval);
+                    return;
+                }
+
+                try {
+                    const res = await fetch(`/api/extract-cookies-status/${currentSessionId}`);
+                    const data = await res.json();
+
+                    updateCookieStatus(data.status, data.message, data.cookies_count, data.current_url);
+
+                    // If complete or failed, stop polling
+                    if (data.status === 'complete') {
+                        clearInterval(pollInterval);
+                        showSuccess(data.message, data.cookies_count);
+
+                        // Auto-close after 3 seconds
+                        setTimeout(() => {
+                            closeCookieModal();
+                            // Refresh session status
+                            checkSession();
+                        }, 3000);
+                    } else if (data.status === 'failed' || data.status === 'timeout') {
+                        clearInterval(pollInterval);
+                        showError(data.message);
+                    }
+
+                } catch (e) {
+                    console.error('Polling error:', e);
+                }
+            }, 2000); // Poll every 2 seconds
+        }
+
+        function updateCookieStatus(status, message, cookiesCount, currentUrl) {
+            const statusText = document.getElementById('status-text');
+            const cookiesCountEl = document.getElementById('cookies-count');
+            const cookiesCountValue = document.getElementById('cookies-count-value');
+            const currentUrlDisplay = document.getElementById('current-url-display');
+            const currentUrlValue = document.getElementById('current-url-value');
+
+            // Update status text
+            const statusMessages = {
+                'initializing': 'Initializing...',
+                'browser_launching': 'Launching browser...',
+                'waiting_for_login': 'Waiting for login...',
+                'extracting': 'Extracting cookies...',
+                'complete': 'Complete!',
+                'failed': 'Failed',
+                'timeout': 'Timeout'
+            };
+
+            statusText.textContent = statusMessages[status] || status;
+
+            // Show cookies count if available
+            if (cookiesCount > 0) {
+                cookiesCountEl.style.display = 'block';
+                cookiesCountValue.textContent = cookiesCount;
+            }
+
+            // Show current URL if available
+            if (currentUrl) {
+                currentUrlDisplay.style.display = 'block';
+                const shortUrl = currentUrl.length > 50 ? currentUrl.substring(0, 50) + '...' : currentUrl;
+                currentUrlValue.textContent = shortUrl;
+                currentUrlValue.title = currentUrl;
+            }
+        }
+
+        async function manualCompleteCookies() {
+            if (!currentSessionId) return;
+
+            try {
+                const res = await fetch(`/api/extract-cookies-complete/${currentSessionId}`, {
+                    method: 'POST'
+                });
+
+                const data = await res.json();
+
+                if (data.success) {
+                    document.getElementById('status-text').textContent = 'Extracting cookies manually...';
+                } else {
+                    alert(data.message || 'Cannot extract in current state');
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        function showSuccess(message, cookiesCount) {
+            document.getElementById('cookie-progress').style.display = 'none';
+            const resultEl = document.getElementById('cookie-result');
+            resultEl.style.display = 'block';
+            resultEl.innerHTML = `
+                <div style="color: #10b981; font-size: 1.2em; margin-bottom: 10px;">✅</div>
+                <div style="color: #065f46; font-weight: 500;">${message || 'Success!'}</div>
+                <div style="color: #6b7280; margin-top: 10px;">Extracted ${cookiesCount} cookies</div>
+                <div style="color: #6b7280; margin-top: 5px;">Scheduler daemon will reload automatically</div>
+            `;
+        }
+
+        function showError(message) {
+            document.getElementById('cookie-progress').style.display = 'none';
+            const resultEl = document.getElementById('cookie-result');
+            resultEl.style.display = 'block';
+            resultEl.innerHTML = `
+                <div style="color: #ef4444; font-size: 1.2em; margin-bottom: 10px;">❌</div>
+                <div style="color: #991b1b; font-weight: 500;">${message || 'Extraction failed'}</div>
+                <div class="modal-buttons" style="margin-top: 20px;">
+                    <button onclick="closeCookieModal()">Close</button>
+                </div>
+            `;
+        }
+
+        // Tab switching
+        function showTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+            event.target.classList.add('active');
+            document.getElementById(tab + '-tab').classList.add('active');
+
+            if (tab === 'scheduled') {
+                loadScheduledBookings();
+            }
+        }
+
+        // Initialize
+        checkSession();
+        loadFacilities();
+    </script>
+</body>
+</html>

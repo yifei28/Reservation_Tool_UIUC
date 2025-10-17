@@ -37,3 +37,14 @@ Thumbs.db
 
 # MCP
 .mcp.json
+
+# Docker data directory (except .gitkeep)
+data/*
+!data/.gitkeep
+
+# PID and signal files
+.scheduler.pid
+.reload_cookies_signal
+
+# Booking schedules
+bookings_schedule.json
