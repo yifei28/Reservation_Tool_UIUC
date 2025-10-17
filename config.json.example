@@ -1,0 +1,14 @@
+{
+  "sport": "badminton",
+  "preferredTimes": [
+    "09:00",
+    "10:00",
+    "11:00"
+  ],
+  "courtPreferences": [
+    "Court 1",
+    "Court 2"
+  ],
+  "notificationEmail": "your-email@example.com",
+  "retryAttempts": 3
+}
