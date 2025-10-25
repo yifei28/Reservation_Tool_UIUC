@@ -86,7 +86,7 @@ def extract_cookies():
         print("=" * 60)
         print()
         print("You can now use these cookies for automated booking.")
-        print("The session will be valid for approximately 8 hours.")
+        print("The session will be valid for approximately 5-20 minutes.")
 
         browser.close()
 
