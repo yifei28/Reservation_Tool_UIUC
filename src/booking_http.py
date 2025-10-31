@@ -521,7 +521,7 @@ class FastBookingClient:
                 break
 
         if not target_slot:
-            logger.debug(f"Slot '{slot_time}' not available on court {facility_id[:8]}")
+            logger.warning(f"Slot '{slot_time}' not found on court {facility_id[:8]}. Available slots: {[s['time_text'] for s in slots]}")
             return None
 
         logger.info(f"Found target slot '{slot_time}' on court {facility_id[:8]}")
