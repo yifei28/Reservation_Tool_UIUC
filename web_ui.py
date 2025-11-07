@@ -200,11 +200,14 @@ def schedule_booking():
 
     try:
         # Parse the date and time
-        # Extract hour and AM/PM from slot_time (e.g., "6 - 7 PM" -> "6 PM")
+        # Extract hour and AM/PM from slot_time (e.g., "6 - 7 PM" -> "6 PM", "11 AM - 12 PM" -> "11 AM")
         parts = slot_time.split()
         hour = parts[0]
-        # Get AM/PM from the end of the string
-        am_pm = 'PM' if 'PM' in slot_time else 'AM'
+        # Get AM/PM from the start time (parts[1]) if it exists, otherwise from the end
+        if len(parts) > 1 and parts[1] in ['AM', 'PM']:
+            am_pm = parts[1]
+        else:
+            am_pm = 'PM' if 'PM' in slot_time else 'AM'
         time_str = f"{hour} {am_pm}"
 
         target_date = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %I %p")
