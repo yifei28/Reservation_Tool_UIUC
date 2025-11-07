@@ -18,6 +18,7 @@ import pickle
 
 from src.booking_http import FastBookingClient
 from src.scheduler import BookingScheduler
+from src.cookie_validator import CookieValidator
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -105,6 +106,17 @@ def check_session():
         'has_session': session_file.exists(),
         'message': 'Session found' if session_file.exists() else 'No session - run extract_cookies.py'
     })
+
+
+@app.route('/api/cookie-status')
+def cookie_status():
+    """Validate if session cookies are still valid."""
+    if not booking_client:
+        return jsonify({'error': 'Client not initialized'}), 500
+
+    validator = CookieValidator()
+    status = validator.validate_cookies(booking_client, SESSION_FILE)
+    return jsonify(status)
 
 
 @app.route('/api/facilities')
@@ -309,17 +321,40 @@ def scheduler_status():
 
 @app.route('/api/reload-cookies', methods=['POST'])
 def reload_cookies():
-    """Signal scheduler daemon to reload cookies."""
+    """Reload cookies in Flask server and signal scheduler daemon."""
+    global booking_client, scheduler
+
     try:
-        # Create signal file
+        # 1. Reload or re-initialize booking client
+        if booking_client:
+            # Client exists, just reload cookies
+            booking_client._load_cookies()
+            logger.info("✅ Reloaded cookies in Flask web server")
+        else:
+            # Client is None, need to re-initialize
+            logger.info("Re-initializing booking client...")
+            booking_client = FastBookingClient(session_file=SESSION_FILE)
+            logger.info("✅ Re-initialized booking client with new cookies")
+
+        # 2. Re-initialize scheduler if needed
+        if not scheduler:
+            logger.info("Re-initializing scheduler...")
+            scheduler = BookingScheduler(schedule_file=SCHEDULE_FILE)
+            logger.info("✅ Re-initialized scheduler")
+
+        # 3. Create signal file for scheduler daemon
         RELOAD_SIGNAL_FILE.touch()
+        logger.info("✅ Signaled scheduler daemon to reload cookies")
 
         return jsonify({
             'success': True,
-            'message': 'Cookie reload signal sent to scheduler daemon'
+            'message': 'Cookies reloaded in web server and scheduler daemon'
         })
+    except FileNotFoundError as e:
+        logger.error(f"❌ Session file not found: {e}")
+        return jsonify({'error': 'No session file found - please extract cookies first'}), 400
     except Exception as e:
-        logger.error(f"Failed to send reload signal: {e}")
+        logger.error(f"❌ Failed to reload cookies: {e}")
         return jsonify({'error': str(e)}), 500
 
 

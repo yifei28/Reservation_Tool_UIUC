@@ -352,11 +352,15 @@
             <p>Fast automated facility reservations</p>
             <div style="display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; margin-top: 15px;">
                 <div id="session-status" class="session-status">Checking session...</div>
+                <button onclick="checkCookieStatus()" id="check-cookie-btn" style="padding: 8px 16px; border-radius: 20px; background: #3b82f6; color: white; border: none; cursor: pointer; font-weight: 500;">
+                    🔍 Check Cookie Status
+                </button>
                 <button onclick="openCookieModal()" style="padding: 8px 16px; border-radius: 20px; background: #f59e0b; color: white; border: none; cursor: pointer; font-weight: 500;">
                     🔄 Reload Cookies
                 </button>
             </div>
             <div id="reload-result" style="margin-top: 10px;"></div>
+            <div id="cookie-status-result" style="margin-top: 10px;"></div>
         </div>
 
         <div class="tabs">
@@ -487,6 +491,81 @@
                 }
             } catch (e) {
                 console.error('Session check failed:', e);
+            }
+        }
+
+        async function checkCookieStatus() {
+            const btn = document.getElementById('check-cookie-btn');
+            const resultEl = document.getElementById('cookie-status-result');
+
+            // Show loading state
+            btn.disabled = true;
+            btn.textContent = '⏳ Checking...';
+            resultEl.innerHTML = '';
+
+            try {
+                const res = await fetch('/api/cookie-status');
+                const data = await res.json();
+
+                if (data.error && !data.valid) {
+                    // Server error or validation error
+                    resultEl.innerHTML = `
+                        <div style="background: #ef4444; color: white; padding: 15px; border-radius: 10px; text-align: center; max-width: 600px; margin: 0 auto;">
+                            <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 10px;">❌ Error</div>
+                            <div>${data.error}</div>
+                        </div>
+                    `;
+                } else if (data.valid) {
+                    // Cookies are valid
+                    resultEl.innerHTML = `
+                        <div style="background: #10b981; color: white; padding: 15px; border-radius: 10px; text-align: center; max-width: 600px; margin: 0 auto;">
+                            <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 10px;">✅ Cookies Valid</div>
+                            <div>Cookie age: ${data.cookie_age_hours} hours</div>
+                            <div style="font-size: 0.9em; margin-top: 5px; opacity: 0.9;">Last checked: ${new Date(data.last_checked).toLocaleTimeString()}</div>
+                        </div>
+                    `;
+                } else {
+                    // Cookies are expired
+                    resultEl.innerHTML = `
+                        <div style="background: #ef4444; color: white; padding: 15px; border-radius: 10px; text-align: center; max-width: 600px; margin: 0 auto;">
+                            <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 10px;">❌ Cookies Expired</div>
+                            <div style="margin-bottom: 10px;">${data.error || 'Session is no longer valid'}</div>
+                            <div style="font-size: 0.9em; opacity: 0.9;">Cookie age: ${data.cookie_age_hours} hours</div>
+                            <div style="margin-top: 15px; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 5px;">
+                                <div style="font-weight: bold; margin-bottom: 5px;">To fix:</div>
+                                <div style="font-family: monospace;">python3 extract_cookies.py</div>
+                            </div>
+                        </div>
+                    `;
+                }
+            } catch (e) {
+                console.error('Cookie status check failed:', e);
+                resultEl.innerHTML = `
+                    <div style="background: #ef4444; color: white; padding: 15px; border-radius: 10px; text-align: center; max-width: 600px; margin: 0 auto;">
+                        <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 10px;">❌ Check Failed</div>
+                        <div>Could not validate cookies: ${e.message}</div>
+                    </div>
+                `;
+            } finally {
+                // Restore button state
+                btn.disabled = false;
+                btn.textContent = '🔍 Check Cookie Status';
+            }
+        }
+
+        async function reloadCookiesInServer() {
+            try {
+                const res = await fetch('/api/reload-cookies', { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    console.log('✅ Cookies reloaded in server:', data.message);
+                    // Reload facilities now that client is initialized
+                    await loadFacilities();
+                } else {
+                    console.error('❌ Failed to reload cookies:', data.error);
+                }
+            } catch (e) {
+                console.error('❌ Error reloading cookies:', e);
             }
         }
 
@@ -774,6 +853,9 @@
                     if (data.status === 'complete') {
                         clearInterval(pollInterval);
                         showSuccess(data.message, data.cookies_count);
+
+                        // Auto-reload cookies in Flask server
+                        reloadCookiesInServer();
 
                         // Auto-close after 3 seconds
                         setTimeout(() => {
