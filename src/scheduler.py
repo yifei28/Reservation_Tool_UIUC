@@ -63,6 +63,10 @@ class BookingScheduler:
         self.last_cookie_check = 0
         self.cookie_check_interval = 300  # Check every 5 minutes
 
+        # Session keep-alive tracking
+        self.last_keep_alive = 0
+        self._randomize_keep_alive_interval()
+
         # Load existing schedule if available
         self._load_schedule()
 
@@ -168,6 +172,30 @@ class BookingScheduler:
         except Exception as e:
             logger.debug(f"Error checking session file: {e}")
 
+    def _randomize_keep_alive_interval(self):
+        """Set a random keep-alive interval between 8-12 minutes."""
+        import random
+        self.keep_alive_interval = random.randint(480, 720)
+
+    def _keep_session_alive(self):
+        """Ping the Active Illinois API to keep the server-side session alive."""
+        now = time.time()
+        if now - self.last_keep_alive < self.keep_alive_interval:
+            return
+
+        self.last_keep_alive = now
+        self._randomize_keep_alive_interval()
+        logger.info("Sending session keep-alive ping...")
+
+        try:
+            alive = self.client.keep_alive()
+            if alive:
+                logger.info("Session keep-alive successful")
+            else:
+                logger.warning("Session appears expired - cookies may need to be re-extracted")
+        except Exception as e:
+            logger.warning(f"Session keep-alive error: {e}")
+
     def run_scheduler(self, daemon: bool = False):
         """
         Run the scheduler loop.
@@ -184,6 +212,9 @@ class BookingScheduler:
             # Check for manual reload signal and automatic cookie refresh
             self._check_reload_signal()
             self._reload_cookies_if_needed()
+
+            # Keep server-side session alive
+            self._keep_session_alive()
 
             # Check for pending bookings
             pending = [b for b in self.scheduled_bookings if b.status == "pending"]

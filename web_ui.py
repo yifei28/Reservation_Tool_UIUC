@@ -15,6 +15,7 @@ import uuid
 import threading
 import time
 import pickle
+import random
 
 from src.booking_http import FastBookingClient
 from src.scheduler import BookingScheduler
@@ -32,6 +33,9 @@ RELOAD_SIGNAL_FILE = Path(os.getenv('RELOAD_SIGNAL_FILE', '.reload_cookies_signa
 
 # Global dictionary to track cookie extraction sessions
 extraction_sessions = {}
+
+# Session keep-alive background thread
+keep_alive_thread = None
 
 # Initialize clients
 try:
@@ -342,7 +346,10 @@ def reload_cookies():
             scheduler = BookingScheduler(schedule_file=SCHEDULE_FILE)
             logger.info("✅ Re-initialized scheduler")
 
-        # 3. Create signal file for scheduler daemon
+        # 3. Ensure keep-alive thread is running
+        start_keep_alive_thread()
+
+        # 4. Create signal file for scheduler daemon
         RELOAD_SIGNAL_FILE.touch()
         logger.info("✅ Signaled scheduler daemon to reload cookies")
 
@@ -558,6 +565,37 @@ def extract_cookies_complete(session_id):
             'success': False,
             'message': f'Cannot extract in current state: {session["status"]}'
         }), 400
+
+
+def session_keep_alive_loop():
+    """Background thread that pings Active Illinois every 8-12 minutes to keep the session alive."""
+    while True:
+        interval = random.randint(480, 720)  # 8-12 minutes
+        time.sleep(interval)
+        if booking_client:
+            try:
+                alive = booking_client.keep_alive()
+                if alive:
+                    logger.info("Session keep-alive ping successful")
+                else:
+                    logger.warning("Session keep-alive: session appears expired")
+            except Exception as e:
+                logger.warning(f"Session keep-alive error: {e}")
+
+
+def start_keep_alive_thread():
+    """Start the session keep-alive background thread if not already running."""
+    global keep_alive_thread
+    if keep_alive_thread and keep_alive_thread.is_alive():
+        return
+    keep_alive_thread = threading.Thread(target=session_keep_alive_loop, daemon=True)
+    keep_alive_thread.start()
+    logger.info("Started session keep-alive background thread (10 min interval)")
+
+
+# Start keep-alive thread when module loads (if we have a valid client)
+if booking_client:
+    start_keep_alive_thread()
 
 
 if __name__ == '__main__':

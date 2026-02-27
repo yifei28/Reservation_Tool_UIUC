@@ -149,6 +149,28 @@ class FastBookingClient:
         except Exception as e:
             logger.debug(f"Connection warm failed (non-critical): {e}")
 
+    def keep_alive(self) -> bool:
+        """
+        Make a lightweight authenticated request to keep the server-side session alive.
+        Uses the ARC_MP1 facilities page as the ping target.
+
+        Returns:
+            True if session is still valid, False if expired
+        """
+        product_id = self.FACILITIES["ARC_MP1"]["product_id"]
+        url = f"{self.BASE_URL}/booking/{product_id}/facilities"
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 200 and 'login' not in response.url.lower():
+                logger.debug("Keep-alive ping successful, session is valid")
+                return True
+            else:
+                logger.warning(f"Keep-alive ping indicates expired session (status={response.status_code}, url={response.url})")
+                return False
+        except Exception as e:
+            logger.warning(f"Keep-alive ping failed: {e}")
+            return False
+
     def prepare_booking(
         self,
         facility: str,
