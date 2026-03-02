@@ -112,6 +112,36 @@ def check_session():
     })
 
 
+@app.route('/api/debug-cookie-jar')
+def debug_cookie_jar():
+    """Debug endpoint: dump the in-memory cookie jar."""
+    if not booking_client:
+        return jsonify({'error': 'Client not initialized'}), 500
+
+    jar_cookies = {name: value for name, value in booking_client.session.cookies.items()}
+
+    # Compare with .session file
+    import pickle
+    session_file = Path(SESSION_FILE)
+    file_cookies = {}
+    if session_file.exists():
+        with open(session_file, 'rb') as f:
+            data = pickle.load(f)
+        file_cookies = data.get('cookies', {})
+
+    # Find extras in jar that aren't in .session file
+    extras = {k: v for k, v in jar_cookies.items() if k not in file_cookies}
+
+    return jsonify({
+        'jar_count': len(jar_cookies),
+        'file_count': len(file_cookies),
+        'extra_count': len(extras),
+        'extras': {k: v[:50] + '...' if len(v) > 50 else v for k, v in extras.items()},
+        'jar_names': sorted(jar_cookies.keys()),
+        'file_names': sorted(file_cookies.keys()),
+    })
+
+
 @app.route('/api/cookie-status')
 def cookie_status():
     """Validate if session cookies are still valid."""
@@ -332,8 +362,9 @@ def reload_cookies():
         # 1. Reload or re-initialize booking client
         if booking_client:
             # Client exists, just reload cookies
+            logger.info(f"Before reload [session={booking_client._cookie_fingerprint()}, jar={len(booking_client.session.cookies)}]")
             booking_client._load_cookies()
-            logger.info("✅ Reloaded cookies in Flask web server")
+            logger.info(f"After reload [session={booking_client._cookie_fingerprint()}, jar={len(booking_client.session.cookies)}]")
         else:
             # Client is None, need to re-initialize
             logger.info("Re-initializing booking client...")
@@ -594,7 +625,8 @@ def start_keep_alive_thread():
 
 
 # Start keep-alive thread when module loads (if we have a valid client)
-if booking_client:
+# Only start in the worker process, not Flask's reloader process
+if booking_client and os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
     start_keep_alive_thread()
 
 

@@ -118,11 +118,20 @@ class FastBookingClient:
 
         cookies = session_data.get('cookies', {})
 
+        # Clear old cookies before loading new ones (important when switching accounts)
+        self.session.cookies.clear()
+
         # Add cookies to session
         for name, value in cookies.items():
             self.session.cookies.set(name, str(value), domain='active.illinois.edu')
 
-        logger.info(f"Loaded {len(cookies)} cookies from {self.session_file}")
+        logger.info(f"Loaded {len(cookies)} cookies from {self.session_file} [session={self._cookie_fingerprint()}]")
+
+    def _cookie_fingerprint(self) -> str:
+        """Return a short fingerprint to identify which account/session is active."""
+        asp_cookie = self.session.cookies.get('.AspNet.ApplicationCookie', '')
+        session_id = self.session.cookies.get('ASP.NET_SessionId', '')
+        return f"asp={asp_cookie[:8]}.. sid={session_id}"
 
     def _get_csrf_token(self) -> Optional[str]:
         """Extract CSRF token from cookies."""
@@ -160,9 +169,14 @@ class FastBookingClient:
         product_id = self.FACILITIES["ARC_MP1"]["product_id"]
         url = f"{self.BASE_URL}/booking/{product_id}/facilities"
         try:
+            jar_before = len(self.session.cookies)
+            logger.info(f"Keep-alive request [session={self._cookie_fingerprint()}, jar={jar_before}]")
             response = self.session.get(url, timeout=10)
+            jar_after = len(self.session.cookies)
+            if jar_before != jar_after:
+                logger.warning(f"Keep-alive changed cookie jar: {jar_before} -> {jar_after}")
             if response.status_code == 200 and 'login' not in response.url.lower():
-                logger.debug("Keep-alive ping successful, session is valid")
+                logger.info(f"Keep-alive ping successful [session={self._cookie_fingerprint()}]")
                 return True
             else:
                 logger.warning(f"Keep-alive ping indicates expired session (status={response.status_code}, url={response.url})")
@@ -620,6 +634,8 @@ class FastBookingClient:
 
         product_id = facility_config["product_id"]
         known_facility_id = facility_config.get("facility_id")
+
+        logger.info(f"book_slot called: {facility} on {date.strftime('%Y-%m-%d')} at {slot_time} [session={self._cookie_fingerprint()}, jar={len(self.session.cookies)}]")
 
         # If specific facility_id provided, use single-court logic (fast path)
         if facility_id:
