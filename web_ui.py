@@ -11,6 +11,7 @@ import logging
 import subprocess
 import os
 import signal
+import sys
 import uuid
 import threading
 import time
@@ -28,6 +29,7 @@ SCHEDULE_FILE = os.getenv('SCHEDULE_FILE', 'bookings_schedule.json')
 SCHEDULER_PID_FILE = Path(os.getenv('PID_FILE', '.scheduler.pid'))
 RELOAD_SIGNAL_FILE = Path(os.getenv('RELOAD_SIGNAL_FILE', '.reload_cookies_signal'))
 ACCOUNTS_DIR = os.getenv('ACCOUNTS_DIR', '.accounts')
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Global dictionary to track cookie extraction sessions
 extraction_sessions = {}
@@ -87,11 +89,11 @@ def start_scheduler_process() -> bool:
     try:
         # Start scheduler as background process
         process = subprocess.Popen(
-            ['python3', 'run_scheduler.py'],
+            [sys.executable, 'run_scheduler.py'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,  # Detach from parent
-            cwd=os.getcwd()
+            cwd=PROJECT_ROOT
         )
 
         # Save PID to file
@@ -102,6 +104,37 @@ def start_scheduler_process() -> bool:
     except Exception as e:
         logger.error(f"Failed to start scheduler: {e}")
         return False
+
+
+def restart_scheduler_process(timeout: float = 5.0) -> bool:
+    """Replace the scheduler daemon so it loads the current application code."""
+    if SCHEDULER_PID_FILE.exists():
+        try:
+            pid = int(SCHEDULER_PID_FILE.read_text().strip())
+        except ValueError:
+            SCHEDULER_PID_FILE.unlink(missing_ok=True)
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                SCHEDULER_PID_FILE.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.error("Could not stop scheduler daemon PID %s: %s", pid, exc)
+                return False
+            else:
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        SCHEDULER_PID_FILE.unlink(missing_ok=True)
+                        break
+                    time.sleep(0.05)
+                else:
+                    logger.error("Scheduler daemon PID %s did not stop", pid)
+                    return False
+
+    return start_scheduler_process()
 
 
 def ensure_scheduler_running():
@@ -718,6 +751,7 @@ def start_keep_alive_thread():
 # Only start in the worker process, not Flask's reloader process
 if account_pool and account_pool.account_count() and os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
     start_keep_alive_thread()
+    restart_scheduler_process()
 
 
 if __name__ == '__main__':

@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 from src.account_pool import AccountLease
 
 
@@ -28,6 +28,7 @@ class WebUiAccountTests(unittest.TestCase):
         WEB_TEMP.cleanup()
 
     def setUp(self):
+        web_ui.SCHEDULER_PID_FILE.unlink(missing_ok=True)
         for account in web_ui.account_pool.list_accounts():
             web_ui.account_pool.remove_account(account['id'])
 
@@ -105,6 +106,27 @@ class WebUiAccountTests(unittest.TestCase):
         self.assertTrue(data['success'])
         self.assertEqual(data['court_name'], 'Court 8 BM/PB')
         self.assertEqual(data['participant_id'], 'participant-id')
+
+    def test_scheduler_uses_web_server_python_environment(self):
+        process = Mock(pid=1234)
+        with patch.object(web_ui.subprocess, 'Popen', return_value=process) as popen:
+            self.assertTrue(web_ui.start_scheduler_process())
+
+        self.assertEqual(popen.call_args.args[0][0], web_ui.sys.executable)
+        self.assertEqual(popen.call_args.kwargs['cwd'], web_ui.PROJECT_ROOT)
+        self.assertEqual(web_ui.SCHEDULER_PID_FILE.read_text(), '1234')
+
+    def test_scheduler_restart_stops_old_process_before_starting(self):
+        web_ui.SCHEDULER_PID_FILE.write_text('1234')
+        with patch.object(web_ui.os, 'kill', side_effect=[None, ProcessLookupError]) as kill, \
+             patch.object(web_ui, 'start_scheduler_process', return_value=True) as start:
+            self.assertTrue(web_ui.restart_scheduler_process())
+
+        self.assertEqual(kill.call_args_list, [
+            call(1234, web_ui.signal.SIGTERM),
+            call(1234, 0),
+        ])
+        start.assert_called_once_with()
 
 
 if __name__ == '__main__':
