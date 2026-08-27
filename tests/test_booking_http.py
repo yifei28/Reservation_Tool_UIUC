@@ -1,6 +1,7 @@
 import pickle
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -44,7 +45,7 @@ class BookingHttpTests(unittest.TestCase):
         facility_id = '11111111-1111-1111-1111-111111111111'
         response = Mock(
             status_code=200,
-            text=f'<button data-facility-id="{facility_id}"></button>'
+            text=f'<button data-facility-id="{facility_id}">Court 3 BM/PB <span>done</span></button>'
         )
         response.raise_for_status = Mock()
 
@@ -55,6 +56,46 @@ class BookingHttpTests(unittest.TestCase):
         self.assertEqual(first, [facility_id])
         self.assertEqual(second, [facility_id])
         self.assertEqual(get.call_count, 1)
+        self.assertEqual(
+            client._get_facility_name('product', facility_id),
+            'Court 3 BM/PB'
+        )
+
+    def test_success_result_contains_exact_court_and_participant_id(self):
+        client = FastBookingClient(str(self.session_file))
+        facility = 'ARC_PICKLEBALL_BADMINTON'
+        product_id = client.FACILITIES[facility]['product_id']
+        court_id = 'a09a3b03-4c6b-4f54-9206-8f4a8f0aae36'
+        client._facility_names_cache[product_id] = {court_id: 'Court 8 BM/PB'}
+        slot = {
+            'apt_id': 'appointment',
+            'timeslot_id': 'timeslot',
+            'timeslot_instance_id': 'instance',
+            'time_text': '4 - 5 PM',
+        }
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            'Success': True,
+            'ParticipantId': 'participant-123',
+        }
+
+        with patch.object(client, '_fetch_slots_for_court', return_value=[slot]), \
+             patch.object(client.session, 'post', return_value=response):
+            success = client.book_slot(
+                facility=facility,
+                date=datetime(2026, 9, 1),
+                slot_time='4 - 5 PM',
+                facility_id=court_id,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(client.last_booking_result, {
+            'success': True,
+            'dry_run': False,
+            'facility_id': court_id,
+            'court_name': 'Court 8 BM/PB',
+            'participant_id': 'participant-123',
+        })
 
     def test_keep_alive_rejects_login_html_at_a_200_url(self):
         client = FastBookingClient(str(self.session_file))

@@ -293,11 +293,16 @@ def book_now():
         else:
             account_pool.release(lease)
 
+        booking_result = lease.client.last_booking_result or {}
+
         return jsonify({
             'success': success,
             'message': 'Booking successful!' if success else 'Booking failed',
             'account_id': lease.account_id,
-            'account_label': lease.label
+            'account_label': lease.label,
+            'court_id': booking_result.get('facility_id'),
+            'court_name': booking_result.get('court_name'),
+            'participant_id': booking_result.get('participant_id')
         })
     except NoAvailableAccountError as e:
         return jsonify({'error': str(e)}), 409
@@ -368,6 +373,10 @@ def list_scheduled():
 
     bookings = scheduler.list_scheduled_bookings()
     now = datetime.now()
+    account_labels = {
+        account['id']: account['label']
+        for account in account_pool.list_accounts()
+    } if account_pool else {}
 
     # Sort by execute_at descending (newest first)
     sorted_bookings = sorted(
@@ -389,6 +398,10 @@ def list_scheduled():
             'status': booking.status,
             'error': booking.error,
             'account_id': booking.account_id,
+            'account_label': account_labels.get(booking.account_id),
+            'court_id': booking.facility_id,
+            'court_name': booking.court_name,
+            'participant_id': booking.participant_id,
             'hours_until': time_until / 3600 if time_until > 0 else 0
         })
 

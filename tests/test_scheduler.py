@@ -19,6 +19,7 @@ class TimedFakeClient:
         self.session_file = Path(session_file)
         with open(self.session_file, 'rb') as handle:
             self.name = pickle.load(handle)['cookies']['account']
+        self.last_booking_result = None
 
     def keep_alive(self):
         return True
@@ -30,7 +31,14 @@ class TimedFakeClient:
         with self.starts_lock:
             self.starts.append((self.name, time.perf_counter()))
         time.sleep(0.03)
-        return self.result_by_account.get(self.name, True)
+        success = self.result_by_account.get(self.name, True)
+        if success:
+            self.last_booking_result = {
+                'facility_id': kwargs.get('facility_id'),
+                'court_name': f'Named {kwargs.get("facility_id")}',
+                'participant_id': f'participant-{self.name}',
+            }
+        return success
 
 
 class SchedulerMultiAccountTests(unittest.TestCase):
@@ -83,10 +91,22 @@ class SchedulerMultiAccountTests(unittest.TestCase):
             self.pool.acquire = original_acquire
 
         self.assertEqual([booking.status for booking in bookings], ['success', 'success'])
+        self.assertEqual(bookings[0].court_name, 'Named court-one')
+        self.assertEqual(bookings[1].participant_id, 'participant-two')
         starts = [started for _, started in TimedFakeClient.starts]
         self.assertLess(max(starts) - min(starts), 0.05)
         accounts = self.pool.list_accounts(datetime(2026, 9, 1))
         self.assertTrue(all(account['used_for_date'] for account in accounts))
+
+        self.scheduler.scheduled_bookings = bookings
+        self.scheduler._save_schedule()
+        reloaded = BookingScheduler(
+            account_pool=self.pool,
+            schedule_file=str(self.root / 'schedule.json'),
+            reload_signal_file=str(self.root / 'reload.signal'),
+        )
+        self.assertEqual(reloaded.scheduled_bookings[0].court_name, 'Named court-one')
+        self.assertEqual(reloaded.scheduled_bookings[1].participant_id, 'participant-two')
 
     def test_failed_booking_releases_account(self):
         TimedFakeClient.result_by_account['one'] = False

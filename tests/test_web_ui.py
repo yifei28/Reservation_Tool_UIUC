@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from src.account_pool import AccountLease
 
 
 # Isolate web_ui's module-level application state before importing it.
@@ -69,6 +70,41 @@ class WebUiAccountTests(unittest.TestCase):
         account = web_ui.account_pool.list_accounts('2026-09-01')[0]
         self.assertFalse(account['used_for_date'])
         self.assertFalse(account['leased_for_date'])
+
+    def test_immediate_booking_response_includes_court_details(self):
+        class ImmediateClient:
+            last_booking_result = {
+                'facility_id': 'court-id',
+                'court_name': 'Court 8 BM/PB',
+                'participant_id': 'participant-id',
+            }
+
+            def prepare_booking(self, **kwargs):
+                return 'court-id'
+
+            def book_slot(self, **kwargs):
+                return True
+
+        lease = AccountLease(
+            account_id='account-id',
+            label='Account One',
+            target_date='2026-09-01',
+            lease_id='lease-id',
+            client=ImmediateClient(),
+        )
+        with patch.object(web_ui.account_pool, 'acquire', return_value=lease), \
+             patch.object(web_ui.account_pool, 'mark_used', return_value=True):
+            response = self.client.post('/api/book', json={
+                'facility': 'ARC_PICKLEBALL_BADMINTON',
+                'date': '2026-09-01',
+                'time': '4 - 5 PM',
+            })
+
+        data = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(data['success'])
+        self.assertEqual(data['court_name'], 'Court 8 BM/PB')
+        self.assertEqual(data['participant_id'], 'participant-id')
 
 
 if __name__ == '__main__':

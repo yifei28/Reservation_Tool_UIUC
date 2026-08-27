@@ -736,7 +736,8 @@
                 const data = await res.json();
 
                 if (data.success) {
-                    alert('✅ Booking successful!');
+                    const court = data.court_name || data.court_id || 'assigned court';
+                    alert(`✅ Booking successful!\nCourt: ${court}\nAccount: ${data.account_label}`);
                     loadSlots(); // Refresh
                 } else {
                     alert('❌ Booking failed: ' + (data.error || data.message));
@@ -817,6 +818,8 @@
                         <div class="booking-info">
                             <strong>${booking.facility}</strong> - ${booking.slot_time}<br>
                             <small>Target: ${booking.target_date} | Executes: ${booking.execute_at}</small><br>
+                            ${booking.court_name || booking.court_id ? `<small>Court: ${escapeHtml(booking.court_name || booking.court_id)}</small><br>` : ''}
+                            ${booking.account_label ? `<small>Account: ${escapeHtml(booking.account_label)}</small><br>` : ''}
                             <small>Time until: ${booking.hours_until.toFixed(1)} hours</small>
                             <span class="status-badge status-${booking.status}">${booking.status}</span>
                         </div>

@@ -34,6 +34,8 @@ class ScheduledBooking:
     error: Optional[str] = None
     booking_id: Optional[str] = None
     account_id: Optional[str] = None
+    court_name: Optional[str] = None
+    participant_id: Optional[str] = None
 
 
 @dataclass
@@ -274,11 +276,19 @@ class BookingScheduler:
                 dry_run=False,
             )
             if success:
+                result = getattr(lease.client, "last_booking_result", None) or {}
                 booking.status = "success"
                 booking.error = None
+                booking.facility_id = result.get("facility_id", booking.facility_id)
+                booking.court_name = result.get("court_name")
+                booking.participant_id = result.get("participant_id")
                 if not self._legacy_client:
                     self.account_pool.mark_used(lease)
-                logger.info("Booking successful with account %s", lease.label)
+                logger.info(
+                    "Booking successful with account %s on %s",
+                    lease.label,
+                    booking.court_name or booking.facility_id or "unknown court",
+                )
             else:
                 booking.status = "failed"
                 booking.error = "Booking returned False"
@@ -336,6 +346,8 @@ class BookingScheduler:
                     "error": booking.error,
                     "booking_id": booking.booking_id,
                     "account_id": booking.account_id,
+                    "court_name": booking.court_name,
+                    "participant_id": booking.participant_id,
                 }
                 for booking in self.scheduled_bookings
             ]
@@ -364,6 +376,8 @@ class BookingScheduler:
                     error=item.get("error"),
                     booking_id=item.get("booking_id") or uuid.uuid4().hex,
                     account_id=item.get("account_id"),
+                    court_name=item.get("court_name"),
+                    participant_id=item.get("participant_id"),
                 )
                 for item in data.get("bookings", [])
             ]

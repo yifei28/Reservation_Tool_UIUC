@@ -93,7 +93,11 @@ def cmd_book(args):
                 print("✅ DRY RUN - Would have booked successfully")
             else:
                 pool.mark_used(lease)
+                result = lease.client.last_booking_result or {}
                 print("✅ BOOKING SUCCESSFUL!")
+                print(f"  Court: {result.get('court_name') or result.get('facility_id') or 'Unknown'}")
+                if result.get('participant_id'):
+                    print(f"  Participant ID: {result['participant_id']}")
                 print(f"\nCheck your bookings at:")
                 print("https://active.illinois.edu/booking/mybookings")
             return 0

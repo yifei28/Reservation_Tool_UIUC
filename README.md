@@ -29,6 +29,7 @@ python3 web_ui.py
 - **Background Daemon** - Runs continuously to execute scheduled bookings
 - **Multiple Accounts** - Rotates valid accounts so each account is used at most once per target date
 - **Automatic Session Refresh** - Keeps every stored account alive and persists renewed cookies
+- **Court Confirmation** - Shows the exact court and account used after a successful reservation
 
 ## Usage
 

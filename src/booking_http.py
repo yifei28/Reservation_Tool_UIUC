@@ -99,6 +99,9 @@ class FastBookingClient:
         self.session = requests.Session()
         self._session_data = {}
         self._facility_ids_cache = {}
+        self._facility_names_cache = {}
+        self.last_booking_result = None
+        self._last_submit_result = {}
         self.last_keep_alive_error = None
         self._load_cookies()
 
@@ -257,6 +260,12 @@ class FastBookingClient:
 
         # If specific facility_id provided, return it
         if facility_id:
+            # Resolve and cache the human-readable court name during preparation,
+            # never at the exact reservation deadline.
+            try:
+                self._get_all_facility_ids(product_id)
+            except Exception as e:
+                logger.debug(f"Could not pre-cache court name: {e}")
             return facility_id
 
         # Pre-fetch all facility IDs to determine if multi-court
@@ -420,9 +429,28 @@ class FastBookingClient:
         facility_ids = list(dict.fromkeys(matches))
 
         self._facility_ids_cache[product_id] = facility_ids
+        names = self._facility_names_cache.setdefault(product_id, {})
+        soup = BeautifulSoup(html, 'html.parser')
+        for element in soup.select('[data-facility-id]'):
+            court_id = element.get('data-facility-id')
+            if not court_id:
+                continue
+            court_name = ' '.join(element.get_text(' ', strip=True).split())
+            # Material Icons renders the selection glyph as the word "done".
+            if court_name.lower().endswith(' done'):
+                court_name = court_name[:-5].strip()
+            if court_name:
+                names[court_id] = court_name
 
         logger.info(f"Found {len(facility_ids)} facility/court IDs for product {product_id}")
         return facility_ids
+
+    def _get_facility_name(self, product_id: str, facility_id: str) -> str:
+        """Return a cached human-readable court name."""
+        return self._facility_names_cache.get(product_id, {}).get(
+            facility_id,
+            f"Court {facility_id[:8]}"
+        )
 
     def _select_initial_court(
         self,
@@ -531,6 +559,7 @@ class FastBookingClient:
         }
 
         logger.debug(f"Submitting booking for court {facility_id[:8]}...")
+        self._last_submit_result = {}
 
         try:
             response = self.session.post(
@@ -548,10 +577,18 @@ class FastBookingClient:
 
                     if result.get('Success'):
                         participant_id = result.get('ParticipantId')
+                        self._last_submit_result = {
+                            'participant_id': participant_id,
+                            'response': result,
+                        }
                         logger.info(f"✅ Booking successful on court {facility_id[:8]}! Participant ID: {participant_id}")
                         return True
                     else:
                         error_code = result.get('ErrorCode', 'Unknown')
+                        self._last_submit_result = {
+                            'error_code': error_code,
+                            'response': result,
+                        }
                         logger.debug(f"Booking failed on court {facility_id[:8]} with error code: {error_code}")
                         return False
 
@@ -611,11 +648,25 @@ class FastBookingClient:
         logger.info(f"Found target slot '{slot_time}' on court {facility_id[:8]}")
 
         if dry_run:
+            self.last_booking_result = {
+                'success': True,
+                'dry_run': True,
+                'facility_id': facility_id,
+                'court_name': self._get_facility_name(product_id, facility_id),
+                'participant_id': None,
+            }
             logger.info(f"DRY RUN - Would book on court {facility_id[:8]}")
             return facility_id
 
         # Submit booking
         if self._submit_booking(product_id, facility_id, date, target_slot):
+            self.last_booking_result = {
+                'success': True,
+                'dry_run': False,
+                'facility_id': facility_id,
+                'court_name': self._get_facility_name(product_id, facility_id),
+                'participant_id': self._last_submit_result.get('participant_id'),
+            }
             return facility_id
         else:
             return None
@@ -682,6 +733,7 @@ class FastBookingClient:
 
         product_id = facility_config["product_id"]
         known_facility_id = facility_config.get("facility_id")
+        self.last_booking_result = None
 
         logger.info(f"book_slot called: {facility} on {date.strftime('%Y-%m-%d')} at {slot_time} [session={self._cookie_fingerprint()}, jar={len(self.session.cookies)}]")
 
