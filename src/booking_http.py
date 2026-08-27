@@ -7,6 +7,9 @@ import pickle
 import logging
 import requests
 import random
+import os
+import time
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -94,6 +97,9 @@ class FastBookingClient:
         """
         self.session_file = Path(session_file)
         self.session = requests.Session()
+        self._session_data = {}
+        self._facility_ids_cache = {}
+        self.last_keep_alive_error = None
         self._load_cookies()
 
         # Performance optimization: Configure connection pooling
@@ -116,6 +122,8 @@ class FastBookingClient:
         with open(self.session_file, 'rb') as f:
             session_data = pickle.load(f)
 
+        self._session_data = session_data
+
         cookies = session_data.get('cookies', {})
 
         # Clear old cookies before loading new ones (important when switching accounts)
@@ -126,6 +134,25 @@ class FastBookingClient:
             self.session.cookies.set(name, str(value), domain='active.illinois.edu')
 
         logger.info(f"Loaded {len(cookies)} cookies from {self.session_file} [session={self._cookie_fingerprint()}]")
+
+    def save_cookies(self):
+        """Persist the current cookie jar, including server-side renewals."""
+        session_data = dict(self._session_data)
+        session_data.update({
+            'cookies': self.session.cookies.get_dict(),
+            'authenticated': True,
+            'auth_time': session_data.get('auth_time', time.time()),
+            'refreshed_at': time.time(),
+        })
+
+        temp_file = self.session_file.with_name(
+            f"{self.session_file.name}.tmp-{uuid.uuid4().hex}"
+        )
+        with open(temp_file, 'wb') as f:
+            pickle.dump(session_data, f)
+        temp_file.chmod(0o600)
+        os.replace(temp_file, self.session_file)
+        self._session_data = session_data
 
     def _cookie_fingerprint(self) -> str:
         """Return a short fingerprint to identify which account/session is active."""
@@ -169,19 +196,31 @@ class FastBookingClient:
         product_id = self.FACILITIES["ARC_MP1"]["product_id"]
         url = f"{self.BASE_URL}/booking/{product_id}/facilities"
         try:
+            self.last_keep_alive_error = None
             jar_before = len(self.session.cookies)
             logger.info(f"Keep-alive request [session={self._cookie_fingerprint()}, jar={jar_before}]")
             response = self.session.get(url, timeout=10)
             jar_after = len(self.session.cookies)
             if jar_before != jar_after:
                 logger.warning(f"Keep-alive changed cookie jar: {jar_before} -> {jar_after}")
-            if response.status_code == 200 and 'login' not in response.url.lower():
+            has_facility_data = (
+                'data-facility-id=' in response.text
+                or 'hdnSelectedFacilityId' in response.text
+            )
+            if (
+                response.status_code == 200
+                and 'login' not in response.url.lower()
+                and has_facility_data
+            ):
+                self.save_cookies()
                 logger.info(f"Keep-alive ping successful [session={self._cookie_fingerprint()}]")
                 return True
             else:
+                self.last_keep_alive_error = 'Session expired or facility data unavailable'
                 logger.warning(f"Keep-alive ping indicates expired session (status={response.status_code}, url={response.url})")
                 return False
         except Exception as e:
+            self.last_keep_alive_error = f'Network error: {e}'
             logger.warning(f"Keep-alive ping failed: {e}")
             return False
 
@@ -343,7 +382,11 @@ class FastBookingClient:
         logger.info(f"Found facility ID: {facility_id}")
         return facility_id
 
-    def _get_all_facility_ids(self, product_id: str) -> List[str]:
+    def _get_all_facility_ids(
+        self,
+        product_id: str,
+        force_refresh: bool = False
+    ) -> List[str]:
         """
         Get all facility IDs for a product (e.g., all 8 pickleball courts).
 
@@ -353,6 +396,9 @@ class FastBookingClient:
         Returns:
             List of facility IDs (court UUIDs)
         """
+        if not force_refresh and product_id in self._facility_ids_cache:
+            return list(self._facility_ids_cache[product_id])
+
         facilities_url = f"{self.BASE_URL}/booking/{product_id}/facilities"
         response = self.session.get(facilities_url)
         response.raise_for_status()
@@ -372,6 +418,8 @@ class FastBookingClient:
 
         # Remove duplicates while preserving order
         facility_ids = list(dict.fromkeys(matches))
+
+        self._facility_ids_cache[product_id] = facility_ids
 
         logger.info(f"Found {len(facility_ids)} facility/court IDs for product {product_id}")
         return facility_ids

@@ -7,11 +7,9 @@ Runs continuously in the background, executing bookings when slots open.
 import sys
 import logging
 import argparse
-from datetime import datetime
-from pathlib import Path
 
 from src.scheduler import BookingScheduler
-from src.booking_http import FastBookingClient
+from src.account_pool import AccountPool
 
 
 def setup_logging(log_file: str = "scheduler.log", verbose: bool = False):
@@ -91,21 +89,21 @@ def main():
     logger.info(f"Daemon mode: {not args.once}")
     logger.info("=" * 80)
 
-    # Verify session file exists
-    if not Path(args.session).exists():
-        logger.error(f"Session file not found: {args.session}")
-        logger.error("Run: python3 extract_cookies.py")
+    account_pool = AccountPool(
+        accounts_dir=os.getenv('ACCOUNTS_DIR', '.accounts'),
+        legacy_session_file=args.session
+    )
+    if account_pool.account_count() == 0:
+        logger.error("No account sessions found. Add an account in the web UI first.")
         return 1
 
     # Initialize booking client and scheduler
     try:
-        logger.info("Initializing fast HTTP booking client...")
-        client = FastBookingClient(session_file=args.session)
-
         logger.info("Initializing scheduler...")
         scheduler = BookingScheduler(
-            booking_client=client,
-            schedule_file=args.schedule
+            account_pool=account_pool,
+            schedule_file=args.schedule,
+            reload_signal_file=os.getenv('RELOAD_SIGNAL_FILE', '.reload_cookies_signal')
         )
 
         # Show scheduled bookings

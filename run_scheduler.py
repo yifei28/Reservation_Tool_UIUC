@@ -5,11 +5,9 @@ Runs independently of the web UI.
 """
 
 import logging
-import time
 import os
-from pathlib import Path
 from src.scheduler import BookingScheduler
-from src.booking_http import FastBookingClient
+from src.account_pool import AccountPool
 
 # Configure logging to both file and console
 log_file = os.getenv('LOG_FILE', 'scheduler.log')
@@ -26,14 +24,19 @@ logger = logging.getLogger(__name__)
 def main():
     logger.info("Starting scheduler daemon...")
 
-    # Check if session file exists
-    session_file = Path('.session')
-    if not session_file.exists():
-        logger.error("No .session file found. Run extract_cookies.py first.")
+    account_pool = AccountPool(
+        accounts_dir=os.getenv('ACCOUNTS_DIR', '.accounts'),
+        legacy_session_file=os.getenv('SESSION_FILE', '.session')
+    )
+    if account_pool.account_count() == 0:
+        logger.error("No account sessions found. Add an account in the web UI first.")
         return
 
-    # Create scheduler
-    scheduler = BookingScheduler()
+    scheduler = BookingScheduler(
+        account_pool=account_pool,
+        schedule_file=os.getenv('SCHEDULE_FILE', 'bookings_schedule.json'),
+        reload_signal_file=os.getenv('RELOAD_SIGNAL_FILE', '.reload_cookies_signal')
+    )
 
     logger.info("Scheduler daemon running. Monitoring for scheduled bookings...")
 

@@ -1,16 +1,21 @@
-"""
-Booking scheduler for Active Illini facilities.
-Schedules bookings to execute exactly when slots become available (72 hours in advance).
+"""Booking scheduler for Active Illini facilities.
+
+Accounts are leased and connections are prepared before the reservation opens.
+Bookings sharing an execution timestamp are released concurrently.
 """
 
-import time
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from dataclasses import dataclass
-from pathlib import Path
 import json
+import logging
+import os
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Optional
 
+from .account_pool import AccountLease, AccountPool, NoAvailableAccountError
 from .booking_http import FastBookingClient
 
 logger = logging.getLogger(__name__)
@@ -21,53 +26,54 @@ class ScheduledBooking:
     """Represents a scheduled booking attempt."""
 
     facility: str
-    target_date: datetime  # The date/time to book FOR
-    slot_time: str  # e.g., "11 AM - 12 PM"
-    execute_at: datetime  # When to execute the booking (72 hours before)
+    target_date: datetime
+    slot_time: str
+    execute_at: datetime
     facility_id: Optional[str] = None
-    status: str = "pending"  # pending, executing, success, failed
+    status: str = "pending"
     error: Optional[str] = None
     booking_id: Optional[str] = None
+    account_id: Optional[str] = None
+
+
+@dataclass
+class PreparedScheduledBooking:
+    """Everything needed at execution time, already loaded in memory."""
+
+    booking: ScheduledBooking
+    lease: AccountLease
 
 
 class BookingScheduler:
-    """Scheduler for automated facility bookings."""
+    """Execute bookings at the opening time with one account per target day."""
 
-    # Slots open exactly 72 hours before the time slot
     BOOKING_WINDOW_HOURS = 72
-
-    # How many seconds before the opening time to wake up and prepare
-    PREP_SECONDS = 10
-
-    # Signal file for manual cookie reload
-    RELOAD_SIGNAL_FILE = Path('.reload_cookies_signal')
+    PREP_SECONDS = 60
+    REFRESH_GUARD_SECONDS = 120
+    SIMULTANEOUS_TOLERANCE_SECONDS = 0.05
 
     def __init__(
         self,
         booking_client: Optional[FastBookingClient] = None,
-        schedule_file: str = "bookings_schedule.json"
+        schedule_file: str = "bookings_schedule.json",
+        account_pool: Optional[AccountPool] = None,
+        accounts_dir: str = ".accounts",
+        legacy_session_file: str = ".session",
+        reload_signal_file: str = ".reload_cookies_signal",
     ):
-        """
-        Initialize scheduler.
-
-        Args:
-            booking_client: FastBookingClient instance (creates new one if None)
-            schedule_file: Path to save/load scheduled bookings
-        """
-        self.client = booking_client or FastBookingClient()
         self.schedule_file = Path(schedule_file)
+        self.reload_signal_file = Path(reload_signal_file)
         self.scheduled_bookings: List[ScheduledBooking] = []
 
-        # Cookie reload tracking
-        self.client_loaded_at = time.time()
-        self.last_cookie_check = 0
-        self.cookie_check_interval = 300  # Check every 5 minutes
-
-        # Session keep-alive tracking
-        self.last_keep_alive = 0
-        self._randomize_keep_alive_interval()
-
-        # Load existing schedule if available
+        # booking_client remains as a compatibility path for explicit callers.
+        # Production uses AccountPool.
+        self._legacy_client = booking_client
+        self.account_pool = account_pool
+        if not self._legacy_client and not self.account_pool:
+            self.account_pool = AccountPool(
+                accounts_dir=accounts_dir,
+                legacy_session_file=legacy_session_file,
+            )
         self._load_schedule()
 
     def schedule_booking(
@@ -76,24 +82,9 @@ class BookingScheduler:
         target_date: datetime,
         slot_time: str,
         facility_id: Optional[str] = None,
-        execute_at: Optional[datetime] = None
+        execute_at: Optional[datetime] = None,
     ) -> ScheduledBooking:
-        """
-        Schedule a booking to execute at a specific time.
-
-        Args:
-            facility: Facility name (e.g., "ARC_MP1")
-            target_date: The date to book FOR
-            slot_time: Time slot text (e.g., "11 AM - 12 PM")
-            facility_id: Optional facility ID
-            execute_at: When to execute the booking. If None, defaults to 72 hours before target_date.
-
-        Returns:
-            ScheduledBooking object
-        """
-        # Calculate when to execute
         if execute_at is None:
-            # Default: 72 hours before target time
             execute_at = target_date - timedelta(hours=self.BOOKING_WINDOW_HOURS)
 
         booking = ScheduledBooking(
@@ -102,292 +93,280 @@ class BookingScheduler:
             slot_time=slot_time,
             execute_at=execute_at,
             facility_id=facility_id,
-            status="pending"
+            status="pending",
+            booking_id=uuid.uuid4().hex,
         )
-
         self.scheduled_bookings.append(booking)
         self._save_schedule()
-
         logger.info(
-            f"Scheduled booking: {facility} on {target_date.strftime('%Y-%m-%d')} "
-            f"at {slot_time} (will execute at {execute_at.strftime('%Y-%m-%d %H:%M:%S')})"
+            "Scheduled booking: %s on %s at %s (executes at %s)",
+            facility,
+            target_date.strftime("%Y-%m-%d"),
+            slot_time,
+            execute_at.strftime("%Y-%m-%d %H:%M:%S"),
         )
-
         return booking
 
-    def reload_cookies(self, force: bool = False):
-        """
-        Reload cookies from session file.
+    def reload_cookies(self, force: bool = False) -> bool:
+        """Validate and refresh every stored account session."""
+        if self._legacy_client:
+            try:
+                self._legacy_client._load_cookies()
+                return True
+            except Exception as exc:
+                logger.error("Failed to reload cookies: %s", exc)
+                return False
 
-        Args:
-            force: If True, reload regardless of last check time
+        results = self.account_pool.refresh_due_accounts(force=force)
+        if not results:
+            return self.account_pool.account_count() > 0
+        return any(results.values())
 
-        Returns:
-            True if reload succeeded, False otherwise
-        """
-        if force:
-            logger.info("Force reloading cookies...")
-
-        try:
-            self.client = FastBookingClient()
-            self.client_loaded_at = time.time()
-            self.last_cookie_check = time.time()
-            logger.info("✅ Cookies reloaded successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to reload cookies: {e}")
-            return False
-
-    def _check_reload_signal(self):
-        """Check if manual reload was requested via signal file."""
-        if self.RELOAD_SIGNAL_FILE.exists():
-            logger.info("📢 Reload signal detected, reloading cookies...")
-            self.reload_cookies(force=True)
-
-            # Remove signal file
-            self.RELOAD_SIGNAL_FILE.unlink()
-
-    def _reload_cookies_if_needed(self):
-        """Reload cookies if session file has been updated."""
-        now = time.time()
-
-        # Only check every 5 minutes
-        if now - self.last_cookie_check < self.cookie_check_interval:
+    def _check_reload_signal(self, time_until_next: Optional[float] = None) -> None:
+        if not self.reload_signal_file.exists():
             return
-
-        self.last_cookie_check = now
-        session_file = Path('.session')
-
-        if not session_file.exists():
-            logger.warning("Session file not found")
+        if time_until_next is not None and time_until_next <= self.REFRESH_GUARD_SECONDS:
+            logger.info("Deferring cookie reload signal until after the imminent booking")
             return
+        logger.info("Reload signal detected; refreshing all account sessions")
+        self.reload_cookies(force=True)
+        self.reload_signal_file.unlink(missing_ok=True)
 
-        # Check if file was modified since we last loaded it
-        try:
-            file_mtime = session_file.stat().st_mtime
-
-            if file_mtime > self.client_loaded_at:
-                logger.info("Detected updated session file, reloading cookies...")
-                self.reload_cookies(force=True)
-        except Exception as e:
-            logger.debug(f"Error checking session file: {e}")
-
-    def _randomize_keep_alive_interval(self):
-        """Set a random keep-alive interval between 8-12 minutes."""
-        import random
-        self.keep_alive_interval = random.randint(480, 720)
-
-    def _keep_session_alive(self):
-        """Ping the Active Illinois API to keep the server-side session alive."""
-        now = time.time()
-        if now - self.last_keep_alive < self.keep_alive_interval:
+    def _refresh_accounts_if_safe(self, time_until_next: Optional[float]) -> None:
+        """Never perform background refresh close to a booking deadline."""
+        if self._legacy_client:
             return
+        if time_until_next is not None and time_until_next <= self.REFRESH_GUARD_SECONDS:
+            return
+        results = self.account_pool.refresh_due_accounts()
+        if results:
+            valid_count = sum(1 for valid in results.values() if valid)
+            logger.info("Refreshed %d accounts (%d valid)", len(results), valid_count)
 
-        self.last_keep_alive = now
-        self._randomize_keep_alive_interval()
-        logger.info("Sending session keep-alive ping...")
-
-        try:
-            alive = self.client.keep_alive()
-            if alive:
-                logger.info("Session keep-alive successful")
-            else:
-                logger.warning("Session appears expired - cookies may need to be re-extracted")
-        except Exception as e:
-            logger.warning(f"Session keep-alive error: {e}")
-
-    def run_scheduler(self, daemon: bool = False):
-        """
-        Run the scheduler loop.
-
-        Args:
-            daemon: If True, run continuously. If False, process once and exit.
-        """
-        logger.info(f"Scheduler started (daemon={daemon})")
+    def run_scheduler(self, daemon: bool = False) -> None:
+        logger.info("Scheduler started (daemon=%s)", daemon)
 
         while True:
-            # Reload schedule to pick up any new bookings added via UI
             self._load_schedule()
-
-            # Check for manual reload signal and automatic cookie refresh
-            self._check_reload_signal()
-            self._reload_cookies_if_needed()
-
-            # Keep server-side session alive
-            self._keep_session_alive()
-
-            # Check for pending bookings
-            pending = [b for b in self.scheduled_bookings if b.status == "pending"]
+            pending = [booking for booking in self.scheduled_bookings if booking.status == "pending"]
 
             if not pending:
+                self._check_reload_signal()
+                self._refresh_accounts_if_safe(None)
                 if daemon:
                     logger.info("No pending bookings. Sleeping for 60 seconds...")
                     time.sleep(60)
                     continue
-                else:
-                    logger.info("No pending bookings. Exiting.")
-                    break
+                logger.info("No pending bookings. Exiting.")
+                break
 
-            # Find next booking to execute
-            next_booking = min(pending, key=lambda b: b.execute_at)
-            now = datetime.now()
-
-            # Calculate time until execution
-            time_until = (next_booking.execute_at - now).total_seconds()
+            next_booking = min(pending, key=lambda booking: booking.execute_at)
+            time_until = (next_booking.execute_at - datetime.now()).total_seconds()
+            self._check_reload_signal(time_until)
+            self._refresh_accounts_if_safe(time_until)
 
             if time_until > self.PREP_SECONDS:
-                # Too early - sleep
                 if daemon:
                     sleep_time = min(time_until - self.PREP_SECONDS, 60)
                     logger.info(
-                        f"Next booking in {time_until:.0f}s. Sleeping for {sleep_time:.0f}s..."
+                        "Next booking in %.0fs. Sleeping for %.0fs...",
+                        time_until,
+                        sleep_time,
                     )
                     time.sleep(sleep_time)
                     continue
-                else:
-                    logger.info(
-                        f"Next booking at {next_booking.execute_at.strftime('%Y-%m-%d %H:%M:%S')} "
-                        f"({time_until:.0f}s from now). Exiting non-daemon mode."
-                    )
-                    break
+                logger.info(
+                    "Next booking at %s (%.0fs from now). Exiting non-daemon mode.",
+                    next_booking.execute_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    time_until,
+                )
+                break
 
-            # Time to execute!
-            self._execute_booking(next_booking)
+            simultaneous = [
+                booking
+                for booking in pending
+                if abs((booking.execute_at - next_booking.execute_at).total_seconds())
+                <= self.SIMULTANEOUS_TOLERANCE_SECONDS
+            ]
+            if not self._legacy_client:
+                quiet_until = max(
+                    booking.execute_at.timestamp() for booking in simultaneous
+                ) + 30
+                self.account_pool.pause_background_refresh(quiet_until)
+            try:
+                prepared = self._prepare_bookings(simultaneous)
+                self._save_schedule()
+                self._execute_prepared_concurrently(prepared)
+                self._save_schedule()
+            finally:
+                if not self._legacy_client:
+                    self.account_pool.clear_background_refresh_pause()
 
-            # Save updated schedule
-            self._save_schedule()
-
-            # If not daemon mode, exit after first execution
             if not daemon:
                 logger.info("Non-daemon mode - exiting after execution")
                 break
 
-    def _execute_booking(self, booking: ScheduledBooking):
-        """
-        Execute a scheduled booking.
-
-        Args:
-            booking: ScheduledBooking to execute
-        """
-        logger.info(f"Executing booking: {booking.facility} - {booking.slot_time}")
-        booking.status = "executing"
-
-        # Pre-warm connection and cache facility data (reduces latency by ~100-200ms)
-        try:
-            cached_facility_id = self.client.prepare_booking(
-                facility=booking.facility,
-                date=booking.target_date,
-                facility_id=booking.facility_id
+    def _lease_account(self, booking: ScheduledBooking) -> AccountLease:
+        if self._legacy_client:
+            return AccountLease(
+                account_id="legacy",
+                label="Legacy account",
+                target_date=booking.target_date.date().isoformat(),
+                lease_id=booking.booking_id or uuid.uuid4().hex,
+                client=self._legacy_client,
             )
-            if cached_facility_id:
-                booking.facility_id = cached_facility_id
-        except Exception as e:
-            logger.warning(f"Preparation failed (non-critical): {e}")
+        return self.account_pool.acquire(booking.target_date, validate=True)
 
-        # Sleep until exact execution time
-        now = datetime.now()
-        wait_time = (booking.execute_at - now).total_seconds()
+    def _prepare_bookings(
+        self, bookings: List[ScheduledBooking]
+    ) -> List[PreparedScheduledBooking]:
+        """Lease accounts and warm network state before the opening time."""
+        prepared = []
+        for booking in bookings:
+            lease = None
+            try:
+                lease = self._lease_account(booking)
+                booking.account_id = lease.account_id
+                booking.status = "executing"
 
+                cached_facility_id = lease.client.prepare_booking(
+                    facility=booking.facility,
+                    date=booking.target_date,
+                    facility_id=booking.facility_id,
+                )
+                if cached_facility_id:
+                    booking.facility_id = cached_facility_id
+                prepared.append(PreparedScheduledBooking(booking, lease))
+                logger.info("Prepared %s with account %s", booking.slot_time, lease.label)
+            except NoAvailableAccountError as exc:
+                booking.status = "failed"
+                booking.error = str(exc)
+                logger.error("Cannot prepare booking: %s", exc)
+            except Exception as exc:
+                if lease and not self._legacy_client:
+                    self.account_pool.release(lease)
+                booking.status = "failed"
+                booking.error = f"Preparation failed: {exc}"
+                logger.error("Booking preparation failed: %s", exc, exc_info=True)
+        return prepared
+
+    def _execute_prepared(self, prepared: PreparedScheduledBooking) -> None:
+        booking = prepared.booking
+        lease = prepared.lease
+
+        wait_time = (booking.execute_at - datetime.now()).total_seconds()
         if wait_time > 0:
-            logger.info(f"Waiting {wait_time:.2f}s until exact execution time...")
             time.sleep(wait_time)
 
-        # Execute the booking
         try:
-            logger.info(f"BOOKING NOW: {booking.facility} on {booking.target_date.strftime('%Y-%m-%d')} at {booking.slot_time}")
-
-            success = self.client.book_slot(
+            logger.info(
+                "BOOKING NOW: %s on %s at %s with account %s",
+                booking.facility,
+                booking.target_date.strftime("%Y-%m-%d"),
+                booking.slot_time,
+                lease.label,
+            )
+            success = lease.client.book_slot(
                 facility=booking.facility,
                 date=booking.target_date,
                 slot_time=booking.slot_time,
                 facility_id=booking.facility_id,
-                dry_run=False
+                dry_run=False,
             )
-
             if success:
                 booking.status = "success"
-                logger.info(f"✅ Booking successful!")
+                booking.error = None
+                if not self._legacy_client:
+                    self.account_pool.mark_used(lease)
+                logger.info("Booking successful with account %s", lease.label)
             else:
                 booking.status = "failed"
                 booking.error = "Booking returned False"
-                logger.error(f"❌ Booking failed")
-
-        except Exception as e:
+                if not self._legacy_client:
+                    self.account_pool.release(lease)
+                logger.error("Booking failed with account %s", lease.label)
+        except Exception as exc:
             booking.status = "failed"
-            booking.error = str(e)
-            logger.error(f"❌ Booking error: {e}", exc_info=True)
+            booking.error = str(exc)
+            if not self._legacy_client:
+                self.account_pool.release(lease)
+            logger.error("Booking error: %s", exc, exc_info=True)
+
+    def _execute_prepared_concurrently(
+        self, prepared: List[PreparedScheduledBooking]
+    ) -> None:
+        if not prepared:
+            return
+        # Workers are created before the deadline and sleep independently until
+        # execute_at, keeping account-pool and thread startup work off the deadline.
+        with ThreadPoolExecutor(max_workers=len(prepared)) as executor:
+            futures = [executor.submit(self._execute_prepared, item) for item in prepared]
+            for future in futures:
+                future.result()
+
+    def _execute_booking(self, booking: ScheduledBooking) -> None:
+        """Compatibility helper for executing one booking immediately."""
+        prepared = self._prepare_bookings([booking])
+        self._execute_prepared_concurrently(prepared)
 
     def list_scheduled_bookings(self) -> List[ScheduledBooking]:
-        """Get all scheduled bookings."""
-        # Reload from file to get latest status (updated by daemon process)
         self._load_schedule()
         return self.scheduled_bookings
 
     def cancel_booking(self, index: int) -> bool:
-        """
-        Cancel a scheduled booking by index.
-
-        Args:
-            index: Index in scheduled_bookings list
-
-        Returns:
-            True if cancelled, False if not found
-        """
         if 0 <= index < len(self.scheduled_bookings):
             booking = self.scheduled_bookings[index]
             if booking.status == "pending":
                 self.scheduled_bookings.pop(index)
                 self._save_schedule()
-                logger.info(f"Cancelled booking: {booking.facility} - {booking.slot_time}")
+                logger.info("Cancelled booking: %s - %s", booking.facility, booking.slot_time)
                 return True
         return False
 
-    def _save_schedule(self):
-        """Save scheduled bookings to file."""
+    def _save_schedule(self) -> None:
         data = {
             "bookings": [
                 {
-                    "facility": b.facility,
-                    "target_date": b.target_date.isoformat(),
-                    "slot_time": b.slot_time,
-                    "execute_at": b.execute_at.isoformat(),
-                    "facility_id": b.facility_id,
-                    "status": b.status,
-                    "error": b.error,
-                    "booking_id": b.booking_id
+                    "facility": booking.facility,
+                    "target_date": booking.target_date.isoformat(),
+                    "slot_time": booking.slot_time,
+                    "execute_at": booking.execute_at.isoformat(),
+                    "facility_id": booking.facility_id,
+                    "status": booking.status,
+                    "error": booking.error,
+                    "booking_id": booking.booking_id,
+                    "account_id": booking.account_id,
                 }
-                for b in self.scheduled_bookings
+                for booking in self.scheduled_bookings
             ]
         }
+        self.schedule_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self.schedule_file.with_name(
+            f"{self.schedule_file.name}.tmp-{uuid.uuid4().hex}"
+        )
+        temp_file.write_text(json.dumps(data, indent=2))
+        os.replace(temp_file, self.schedule_file)
+        logger.debug("Schedule saved to %s", self.schedule_file)
 
-        self.schedule_file.write_text(json.dumps(data, indent=2))
-        logger.debug(f"Schedule saved to {self.schedule_file}")
-
-    def _load_schedule(self):
-        """Load scheduled bookings from file."""
+    def _load_schedule(self) -> None:
         if not self.schedule_file.exists():
-            logger.debug(f"No existing schedule file at {self.schedule_file}")
             return
-
         try:
             data = json.loads(self.schedule_file.read_text())
-
             self.scheduled_bookings = [
                 ScheduledBooking(
-                    facility=b["facility"],
-                    target_date=datetime.fromisoformat(b["target_date"]),
-                    slot_time=b["slot_time"],
-                    execute_at=datetime.fromisoformat(b["execute_at"]),
-                    facility_id=b.get("facility_id"),
-                    status=b.get("status", "pending"),
-                    error=b.get("error"),
-                    booking_id=b.get("booking_id")
+                    facility=item["facility"],
+                    target_date=datetime.fromisoformat(item["target_date"]),
+                    slot_time=item["slot_time"],
+                    execute_at=datetime.fromisoformat(item["execute_at"]),
+                    facility_id=item.get("facility_id"),
+                    status=item.get("status", "pending"),
+                    error=item.get("error"),
+                    booking_id=item.get("booking_id") or uuid.uuid4().hex,
+                    account_id=item.get("account_id"),
                 )
-                for b in data.get("bookings", [])
+                for item in data.get("bookings", [])
             ]
-
-            logger.info(f"Loaded {len(self.scheduled_bookings)} scheduled bookings from {self.schedule_file}")
-
-        except Exception as e:
-            logger.error(f"Error loading schedule: {e}")
+        except Exception as exc:
+            logger.error("Error loading schedule: %s", exc)
             self.scheduled_bookings = []

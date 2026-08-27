@@ -10,12 +10,12 @@ Instructions:
 """
 
 import sys
-import pickle
-import time
-from pathlib import Path
+import argparse
+import os
 from playwright.sync_api import sync_playwright
+from src.account_pool import AccountPool
 
-def extract_cookies():
+def extract_cookies(label: str, account_id: str = None):
     """Launch browser, wait for manual login, then extract cookies."""
 
     print("=" * 60)
@@ -57,28 +57,14 @@ def extract_cookies():
 
         print(f"\n✓ Extracted {len(cookies)} cookies")
 
-        # Convert to requests-compatible format and save
-        session_data = {
-            'cookies': {},
-            'authenticated': True,
-            'auth_time': time.time()
-        }
+        cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
+        pool = AccountPool(
+            accounts_dir=os.getenv('ACCOUNTS_DIR', '.accounts'),
+            legacy_session_file=os.getenv('SESSION_FILE', '.session')
+        )
+        stored_id = pool.store_cookies(label, cookie_dict, account_id=account_id)
 
-        for cookie in cookies:
-            session_data['cookies'][cookie['name']] = cookie['value']
-
-        # Save to .session file
-        session_file = Path('.session')
-        with open(session_file, 'wb') as f:
-            pickle.dump(session_data, f)
-
-        session_file.chmod(0o600)  # Secure permissions
-
-        print(f"✓ Saved session to {session_file}")
-        print()
-        print("Cookie details:")
-        for name, value in session_data['cookies'].items():
-            print(f"  - {name}: {value[:30]}..." if len(value) > 30 else f"  - {name}: {value}")
+        print(f"✓ Saved account '{label}' ({stored_id})")
 
         print()
         print("=" * 60)
@@ -91,8 +77,15 @@ def extract_cookies():
         browser.close()
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Add or refresh an Active Illini account')
+    parser.add_argument('--label', help='Friendly account label')
+    parser.add_argument('--account-id', help='Existing account ID to refresh')
+    args = parser.parse_args()
+    label = args.label or input('Account label: ').strip()
+    if not label:
+        label = 'Account'
     try:
-        extract_cookies()
+        extract_cookies(label, args.account_id)
     except KeyboardInterrupt:
         print("\n\nCancelled by user")
         sys.exit(1)

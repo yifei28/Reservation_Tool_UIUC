@@ -13,11 +13,11 @@ Commands:
 import sys
 import logging
 import argparse
-from datetime import datetime, timedelta
-from pathlib import Path
+import os
+from datetime import datetime
 
-from src.booking_http import FastBookingClient
 from src.scheduler import BookingScheduler
+from src.account_pool import AccountPool, NoAvailableAccountError
 
 
 def setup_logging(verbose: bool = False):
@@ -33,14 +33,18 @@ def cmd_book(args):
     """Book a facility immediately."""
     logging.info(f"Booking {args.facility} on {args.date} at {args.time}")
 
+    lease = None
     try:
-        client = FastBookingClient(session_file=args.session)
-
         # Parse date
         target_date = datetime.strptime(args.date, "%Y-%m-%d")
+        pool = AccountPool(
+            accounts_dir=os.getenv('ACCOUNTS_DIR', '.accounts'),
+            legacy_session_file=args.session
+        )
 
         # Check if slot is available first
         if not args.force:
+            client = pool.get_client()
             print(f"Checking availability for {args.date}...")
             slots = client.check_available_slots(args.facility, target_date)
 
@@ -74,7 +78,9 @@ def cmd_book(args):
 
         # Book it
         print("\nBooking...")
-        success = client.book_slot(
+        lease = pool.acquire(target_date, validate=True)
+        lease.client.prepare_booking(facility=args.facility, date=target_date)
+        success = lease.client.book_slot(
             facility=args.facility,
             date=target_date,
             slot_time=args.time,
@@ -83,21 +89,29 @@ def cmd_book(args):
 
         if success:
             if args.dry_run:
+                pool.release(lease)
                 print("✅ DRY RUN - Would have booked successfully")
             else:
+                pool.mark_used(lease)
                 print("✅ BOOKING SUCCESSFUL!")
                 print(f"\nCheck your bookings at:")
                 print("https://active.illinois.edu/booking/mybookings")
             return 0
         else:
+            pool.release(lease)
             print("❌ BOOKING FAILED")
             return 1
 
+    except NoAvailableAccountError as e:
+        print(f"❌ {e}")
+        return 1
     except FileNotFoundError as e:
         print(f"❌ {e}")
         print("Run: python3 extract_cookies.py")
         return 1
     except Exception as e:
+        if lease:
+            pool.release(lease)
         logging.error(f"Booking error: {e}", exc_info=args.verbose)
         return 1
 
@@ -106,7 +120,10 @@ def cmd_schedule(args):
     """Schedule a booking for when slots open."""
     try:
         # Parse date
-        target_date = datetime.strptime(f"{args.date} {args.time.split()[0]}", "%Y-%m-%d %I")
+        parts = args.time.split()
+        hour = parts[0]
+        am_pm = parts[1] if len(parts) > 1 and parts[1] in ('AM', 'PM') else ('PM' if 'PM' in args.time else 'AM')
+        target_date = datetime.strptime(f"{args.date} {hour} {am_pm}", "%Y-%m-%d %I %p")
 
         # Initialize scheduler
         scheduler = BookingScheduler(schedule_file=args.schedule)

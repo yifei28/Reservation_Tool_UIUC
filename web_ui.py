@@ -5,7 +5,7 @@ Simple Flask-based interface for booking and scheduling
 """
 
 from flask import Flask, render_template, request, jsonify, redirect, url_for
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 import logging
 import subprocess
@@ -14,12 +14,9 @@ import signal
 import uuid
 import threading
 import time
-import pickle
-import random
 
-from src.booking_http import FastBookingClient
 from src.scheduler import BookingScheduler
-from src.cookie_validator import CookieValidator
+from src.account_pool import AccountPool, NoAvailableAccountError
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +27,7 @@ SESSION_FILE = os.getenv('SESSION_FILE', '.session')
 SCHEDULE_FILE = os.getenv('SCHEDULE_FILE', 'bookings_schedule.json')
 SCHEDULER_PID_FILE = Path(os.getenv('PID_FILE', '.scheduler.pid'))
 RELOAD_SIGNAL_FILE = Path(os.getenv('RELOAD_SIGNAL_FILE', '.reload_cookies_signal'))
+ACCOUNTS_DIR = os.getenv('ACCOUNTS_DIR', '.accounts')
 
 # Global dictionary to track cookie extraction sessions
 extraction_sessions = {}
@@ -37,14 +35,34 @@ extraction_sessions = {}
 # Session keep-alive background thread
 keep_alive_thread = None
 
-# Initialize clients
+# Initialize the shared multi-account pool. Existing .session data is imported
+# once as "Default account" for backward compatibility.
 try:
-    booking_client = FastBookingClient(session_file=SESSION_FILE)
-    scheduler = BookingScheduler(schedule_file=SCHEDULE_FILE)
+    account_pool = AccountPool(
+        accounts_dir=ACCOUNTS_DIR,
+        legacy_session_file=SESSION_FILE
+    )
+    scheduler = BookingScheduler(
+        schedule_file=SCHEDULE_FILE,
+        account_pool=account_pool,
+        reload_signal_file=str(RELOAD_SIGNAL_FILE)
+    )
+    try:
+        booking_client = account_pool.get_client()
+    except NoAvailableAccountError:
+        booking_client = None
 except Exception as e:
     logger.warning(f"Could not initialize clients: {e}")
+    account_pool = None
     booking_client = None
     scheduler = None
+
+
+def get_booking_client(account_id=None):
+    """Get a current pool client for non-consuming operations."""
+    if not account_pool:
+        raise NoAvailableAccountError('Account pool is not initialized')
+    return account_pool.get_client(account_id)
 
 
 def is_scheduler_running() -> bool:
@@ -70,8 +88,8 @@ def start_scheduler_process() -> bool:
         # Start scheduler as background process
         process = subprocess.Popen(
             ['python3', 'run_scheduler.py'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,  # Detach from parent
             cwd=os.getcwd()
         )
@@ -104,25 +122,58 @@ def index():
 
 @app.route('/api/check-session')
 def check_session():
-    """Check if session file exists."""
-    session_file = Path(SESSION_FILE)
+    """Check whether at least one account session is stored."""
+    account_count = account_pool.account_count() if account_pool else 0
     return jsonify({
-        'has_session': session_file.exists(),
-        'message': 'Session found' if session_file.exists() else 'No session - run extract_cookies.py'
+        'has_session': account_count > 0,
+        'account_count': account_count,
+        'message': f'{account_count} account session(s) found' if account_count else 'No accounts - add an account'
     })
+
+
+@app.route('/api/accounts')
+def list_accounts():
+    """List stored accounts and optional usage for a target date."""
+    if not account_pool:
+        return jsonify({'error': 'Account pool not initialized'}), 500
+    target_date = request.args.get('date')
+    return jsonify(account_pool.list_accounts(target_date))
+
+
+@app.route('/api/accounts/<account_id>', methods=['DELETE'])
+def remove_account(account_id):
+    """Remove one stored account session."""
+    if not account_pool:
+        return jsonify({'error': 'Account pool not initialized'}), 500
+    removed = account_pool.remove_account(account_id)
+    return jsonify({
+        'success': removed,
+        'message': 'Account removed' if removed else 'Account not found'
+    }), 200 if removed else 404
+
+
+@app.route('/api/accounts/<account_id>/validate', methods=['POST'])
+def validate_account(account_id):
+    """Validate and persist refreshed cookies for one account."""
+    if not account_pool:
+        return jsonify({'error': 'Account pool not initialized'}), 500
+    valid = account_pool.validate_account(account_id)
+    return jsonify({'success': valid, 'valid': valid})
 
 
 @app.route('/api/debug-cookie-jar')
 def debug_cookie_jar():
     """Debug endpoint: dump the in-memory cookie jar."""
-    if not booking_client:
-        return jsonify({'error': 'Client not initialized'}), 500
+    try:
+        client = get_booking_client(request.args.get('account_id'))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-    jar_cookies = {name: value for name, value in booking_client.session.cookies.items()}
+    jar_cookies = {name: value for name, value in client.session.cookies.items()}
 
     # Compare with .session file
     import pickle
-    session_file = Path(SESSION_FILE)
+    session_file = client.session_file
     file_cookies = {}
     if session_file.exists():
         with open(session_file, 'rb') as f:
@@ -144,21 +195,37 @@ def debug_cookie_jar():
 
 @app.route('/api/cookie-status')
 def cookie_status():
-    """Validate if session cookies are still valid."""
-    if not booking_client:
-        return jsonify({'error': 'Client not initialized'}), 500
+    """Validate one account or refresh the complete account pool."""
+    if not account_pool:
+        return jsonify({'error': 'Account pool not initialized', 'valid': False}), 500
+    account_id = request.args.get('account_id')
+    if account_id:
+        valid = account_pool.validate_account(account_id)
+        account = next(
+            (item for item in account_pool.list_accounts() if item['id'] == account_id),
+            None
+        )
+        return jsonify({
+            'valid': valid,
+            'error': None if valid else (account or {}).get('last_error', 'Session expired'),
+            'account': account
+        })
 
-    validator = CookieValidator()
-    status = validator.validate_cookies(booking_client, SESSION_FILE)
-    return jsonify(status)
+    results = account_pool.refresh_due_accounts(force=True)
+    accounts = account_pool.list_accounts()
+    valid_count = sum(1 for item in accounts if item['status'] == 'valid')
+    return jsonify({
+        'valid': valid_count > 0,
+        'valid_count': valid_count,
+        'account_count': len(accounts),
+        'accounts': accounts,
+        'error': None if valid_count else 'No valid account sessions'
+    })
 
 
 @app.route('/api/facilities')
 def get_facilities():
     """Get list of available facilities."""
-    if not booking_client:
-        return jsonify({'error': 'Client not initialized'}), 500
-
     facilities = [
         {'id': 'ARC_GYM_2_VOLLEYBALL_COURTS', 'name': 'ARC Gym 2 Volleyball Courts'},
         {'id': 'ARC_MP1', 'name': 'ARC Multi-Purpose Court 1'},
@@ -182,16 +249,14 @@ def get_facilities():
 @app.route('/api/slots', methods=['POST'])
 def get_slots():
     """Get available slots for a facility and date."""
-    if not booking_client:
-        return jsonify({'error': 'Client not initialized'}), 500
-
     data = request.json
     facility = data.get('facility')
     date_str = data.get('date')
 
     try:
+        client = get_booking_client()
         date = datetime.strptime(date_str, '%Y-%m-%d')
-        slots = booking_client.check_available_slots(facility, date)
+        slots = client.check_available_slots(facility, date)
 
         return jsonify({
             'slots': slots,
@@ -206,28 +271,39 @@ def get_slots():
 @app.route('/api/book', methods=['POST'])
 def book_now():
     """Book a slot immediately."""
-    if not booking_client:
-        return jsonify({'error': 'Client not initialized'}), 500
-
     data = request.json
     facility = data.get('facility')
     date_str = data.get('date')
     slot_time = data.get('time')
 
+    lease = None
     try:
         date = datetime.strptime(date_str, '%Y-%m-%d')
-        success = booking_client.book_slot(
+        lease = account_pool.acquire(date, validate=True)
+        lease.client.prepare_booking(facility=facility, date=date)
+        success = lease.client.book_slot(
             facility=facility,
             date=date,
             slot_time=slot_time,
             dry_run=False
         )
 
+        if success:
+            account_pool.mark_used(lease)
+        else:
+            account_pool.release(lease)
+
         return jsonify({
             'success': success,
-            'message': 'Booking successful!' if success else 'Booking failed'
+            'message': 'Booking successful!' if success else 'Booking failed',
+            'account_id': lease.account_id,
+            'account_label': lease.label
         })
+    except NoAvailableAccountError as e:
+        return jsonify({'error': str(e)}), 409
     except Exception as e:
+        if lease:
+            account_pool.release(lease)
         logger.error(f"Booking error: {e}")
         return jsonify({'error': str(e)}), 500
 
@@ -311,6 +387,8 @@ def list_scheduled():
             'slot_time': booking.slot_time,
             'execute_at': booking.execute_at.strftime('%Y-%m-%d %H:%M:%S'),
             'status': booking.status,
+            'error': booking.error,
+            'account_id': booking.account_id,
             'hours_until': time_until / 3600 if time_until > 0 else 0
         })
 
@@ -355,38 +433,27 @@ def scheduler_status():
 
 @app.route('/api/reload-cookies', methods=['POST'])
 def reload_cookies():
-    """Reload cookies in Flask server and signal scheduler daemon."""
+    """Refresh all account sessions and signal the scheduler daemon."""
     global booking_client, scheduler
 
     try:
-        # 1. Reload or re-initialize booking client
-        if booking_client:
-            # Client exists, just reload cookies
-            logger.info(f"Before reload [session={booking_client._cookie_fingerprint()}, jar={len(booking_client.session.cookies)}]")
-            booking_client._load_cookies()
-            logger.info(f"After reload [session={booking_client._cookie_fingerprint()}, jar={len(booking_client.session.cookies)}]")
-        else:
-            # Client is None, need to re-initialize
-            logger.info("Re-initializing booking client...")
-            booking_client = FastBookingClient(session_file=SESSION_FILE)
-            logger.info("✅ Re-initialized booking client with new cookies")
+        if not account_pool:
+            return jsonify({'error': 'Account pool not initialized'}), 500
+        results = account_pool.refresh_due_accounts(force=True)
+        try:
+            booking_client = account_pool.get_client()
+        except NoAvailableAccountError:
+            booking_client = None
 
-        # 2. Re-initialize scheduler if needed
-        if not scheduler:
-            logger.info("Re-initializing scheduler...")
-            scheduler = BookingScheduler(schedule_file=SCHEDULE_FILE)
-            logger.info("✅ Re-initialized scheduler")
-
-        # 3. Ensure keep-alive thread is running
         start_keep_alive_thread()
-
-        # 4. Create signal file for scheduler daemon
         RELOAD_SIGNAL_FILE.touch()
-        logger.info("✅ Signaled scheduler daemon to reload cookies")
+        valid_count = sum(1 for valid in results.values() if valid)
 
         return jsonify({
-            'success': True,
-            'message': 'Cookies reloaded in web server and scheduler daemon'
+            'success': valid_count > 0,
+            'valid_count': valid_count,
+            'account_count': account_pool.account_count(),
+            'message': f'Refreshed {valid_count} valid account session(s)'
         })
     except FileNotFoundError as e:
         logger.error(f"❌ Session file not found: {e}")
@@ -396,26 +463,16 @@ def reload_cookies():
         return jsonify({'error': str(e)}), 500
 
 
-def save_cookies_to_session(cookies):
-    """Save Playwright cookies to .session file."""
-    session_data = {
-        'cookies': {},
-        'authenticated': True,
-        'auth_time': time.time()
-    }
-
-    for cookie in cookies:
-        session_data['cookies'][cookie['name']] = cookie['value']
-
-    # Save to session file
-    session_file = Path(SESSION_FILE)
-    with open(session_file, 'wb') as f:
-        pickle.dump(session_data, f)
-
-    session_file.chmod(0o600)  # Secure permissions
-
-    logger.info(f"✅ Saved {len(cookies)} cookies to {SESSION_FILE}")
-    return len(cookies)
+def save_cookies_to_session(cookies, label, account_id=None):
+    """Save Playwright cookies as one account-specific session."""
+    cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
+    stored_id = account_pool.store_cookies(
+        label=label,
+        cookies=cookie_dict,
+        account_id=account_id
+    )
+    logger.info("Saved %d cookies for account %s", len(cookies), label)
+    return len(cookies), stored_id
 
 
 def run_cookie_extraction_browser(session_id):
@@ -489,10 +546,15 @@ def run_cookie_extraction_browser(session_id):
             if extraction_sessions[session_id]['status'] == 'extracting':
                 try:
                     cookies = context.cookies()
-                    cookies_count = save_cookies_to_session(cookies)
+                    cookies_count, account_id = save_cookies_to_session(
+                        cookies,
+                        extraction_sessions[session_id]['label'],
+                        extraction_sessions[session_id].get('account_id')
+                    )
 
                     extraction_sessions[session_id]['status'] = 'complete'
                     extraction_sessions[session_id]['cookies_count'] = cookies_count
+                    extraction_sessions[session_id]['account_id'] = account_id
                     extraction_sessions[session_id]['message'] = f'Successfully extracted {cookies_count} cookies'
 
                     # Signal scheduler daemon to reload cookies
@@ -524,6 +586,20 @@ def run_cookie_extraction_browser(session_id):
 def extract_cookies_start():
     """Launch Playwright browser for manual login and cookie extraction."""
     try:
+        data = request.get_json(silent=True) or {}
+        label = (data.get('label') or '').strip()
+        account_id = data.get('account_id')
+        if account_id:
+            existing = next(
+                (item for item in account_pool.list_accounts() if item['id'] == account_id),
+                None
+            )
+            if not existing:
+                return jsonify({'error': 'Account not found'}), 404
+            label = label or existing['label']
+        if not label:
+            return jsonify({'error': 'Account label is required'}), 400
+
         session_id = str(uuid.uuid4())
 
         # Initialize session tracking
@@ -534,7 +610,9 @@ def extract_cookies_start():
             'current_url': '',
             'browser': None,
             'context': None,
-            'page': None
+            'page': None,
+            'label': label,
+            'account_id': account_id
         }
 
         # Start background thread
@@ -570,7 +648,9 @@ def extract_cookies_status(session_id):
         'status': session['status'],
         'message': session.get('message', ''),
         'cookies_count': session.get('cookies_count', 0),
-        'current_url': session.get('current_url', '')
+        'current_url': session.get('current_url', ''),
+        'account_id': session.get('account_id'),
+        'label': session.get('label')
     })
 
 
@@ -599,17 +679,14 @@ def extract_cookies_complete(session_id):
 
 
 def session_keep_alive_loop():
-    """Background thread that pings Active Illinois every 8-12 minutes to keep the session alive."""
+    """Refresh due account sessions outside reservation execution."""
     while True:
-        interval = random.randint(480, 720)  # 8-12 minutes
-        time.sleep(interval)
-        if booking_client:
+        time.sleep(60)
+        if account_pool:
             try:
-                alive = booking_client.keep_alive()
-                if alive:
-                    logger.info("Session keep-alive ping successful")
-                else:
-                    logger.warning("Session keep-alive: session appears expired")
+                results = account_pool.refresh_due_accounts()
+                if results:
+                    logger.info("Background-refreshed %d account sessions", len(results))
             except Exception as e:
                 logger.warning(f"Session keep-alive error: {e}")
 
@@ -626,7 +703,7 @@ def start_keep_alive_thread():
 
 # Start keep-alive thread when module loads (if we have a valid client)
 # Only start in the worker process, not Flask's reloader process
-if booking_client and os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+if account_pool and account_pool.account_count() and os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
     start_keep_alive_thread()
 
 

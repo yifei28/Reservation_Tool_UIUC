@@ -308,7 +308,12 @@
     <!-- Cookie Extraction Modal -->
     <div id="cookie-modal" class="modal-overlay">
         <div class="modal-content">
-            <h3 class="modal-header">🔄 Reload Authentication Cookies</h3>
+            <h3 id="cookie-modal-title" class="modal-header">➕ Add Account</h3>
+
+            <div class="form-group" id="account-label-group">
+                <label>Account label</label>
+                <input id="account-label" type="text" placeholder="e.g. Personal, Roommate">
+            </div>
 
             <div id="cookie-status" class="modal-status">
                 <p><strong>Status:</strong> <span id="status-text">Ready</span></p>
@@ -356,11 +361,22 @@
                     🔍 Check Cookie Status
                 </button>
                 <button onclick="openCookieModal()" style="padding: 8px 16px; border-radius: 20px; background: #f59e0b; color: white; border: none; cursor: pointer; font-weight: 500;">
-                    🔄 Reload Cookies
+                    ➕ Add Account
                 </button>
             </div>
             <div id="reload-result" style="margin-top: 10px;"></div>
             <div id="cookie-status-result" style="margin-top: 10px;"></div>
+        </div>
+
+        <div class="card" style="padding: 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <div>
+                    <h2 style="font-size: 1.2em;">Stored Accounts</h2>
+                    <small style="color: #6b7280;">One successful reservation per account and target date</small>
+                </div>
+                <button onclick="loadAccounts()">Refresh</button>
+            </div>
+            <div id="accounts-list" class="bookings-list"><div class="loading">Loading...</div></div>
         </div>
 
         <div class="tabs">
@@ -486,10 +502,10 @@
 
                 if (data.has_session) {
                     statusEl.className = 'session-status session-ok';
-                    statusEl.textContent = '✓ Session Active';
+                    statusEl.textContent = `✓ ${data.account_count} Account${data.account_count === 1 ? '' : 's'} Stored`;
                 } else {
                     statusEl.className = 'session-status session-error';
-                    statusEl.textContent = '✗ No Session - Run extract_cookies.py';
+                    statusEl.textContent = '✗ No Accounts - Add Account';
                 }
             } catch (e) {
                 console.error('Session check failed:', e);
@@ -518,12 +534,10 @@
                         </div>
                     `;
                 } else if (data.valid) {
-                    // Cookies are valid
                     resultEl.innerHTML = `
                         <div style="background: #10b981; color: white; padding: 15px; border-radius: 10px; text-align: center; max-width: 600px; margin: 0 auto;">
-                            <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 10px;">✅ Cookies Valid</div>
-                            <div>Cookie age: ${data.cookie_age_hours} hours</div>
-                            <div style="font-size: 0.9em; margin-top: 5px; opacity: 0.9;">Last checked: ${new Date(data.last_checked).toLocaleTimeString()}</div>
+                            <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 10px;">✅ Account Pool Ready</div>
+                            <div>${data.valid_count} of ${data.account_count} account sessions valid</div>
                         </div>
                     `;
                 } else {
@@ -532,10 +546,9 @@
                         <div style="background: #ef4444; color: white; padding: 15px; border-radius: 10px; text-align: center; max-width: 600px; margin: 0 auto;">
                             <div style="font-size: 1.2em; font-weight: bold; margin-bottom: 10px;">❌ Cookies Expired</div>
                             <div style="margin-bottom: 10px;">${data.error || 'Session is no longer valid'}</div>
-                            <div style="font-size: 0.9em; opacity: 0.9;">Cookie age: ${data.cookie_age_hours} hours</div>
                             <div style="margin-top: 15px; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 5px;">
                                 <div style="font-weight: bold; margin-bottom: 5px;">To fix:</div>
-                                <div style="font-family: monospace;">python3 extract_cookies.py</div>
+                                <div>Re-login the expired accounts below.</div>
                             </div>
                         </div>
                     `;
@@ -553,6 +566,62 @@
                 btn.disabled = false;
                 btn.textContent = '🔍 Check Cookie Status';
             }
+        }
+
+        function escapeHtml(value) {
+            const element = document.createElement('div');
+            element.textContent = value == null ? '' : String(value);
+            return element.innerHTML;
+        }
+
+        async function loadAccounts() {
+            const listEl = document.getElementById('accounts-list');
+            const date = document.getElementById('book-date')?.value || document.getElementById('schedule-date')?.value;
+            const suffix = date ? `?date=${encodeURIComponent(date)}` : '';
+            try {
+                const res = await fetch('/api/accounts' + suffix);
+                const accounts = await res.json();
+                if (!Array.isArray(accounts) || accounts.length === 0) {
+                    storedAccountsById = {};
+                    listEl.innerHTML = '<p>No accounts stored. Click “Add Account” to log in.</p>';
+                    return;
+                }
+                storedAccountsById = Object.fromEntries(accounts.map(account => [account.id, account]));
+                listEl.innerHTML = accounts.map(account => {
+                    const unavailable = account.used_for_date ? 'used for selected date' :
+                        (account.leased_for_date ? 'reserved for selected date' : account.status);
+                    const color = account.status === 'valid' ? '#10b981' :
+                        (account.status === 'invalid' ? '#ef4444' : '#f59e0b');
+                    return `
+                        <div class="booking-item">
+                            <div class="booking-info">
+                                <strong>${escapeHtml(account.label)}</strong><br>
+                                <small style="color: ${color};">${escapeHtml(unavailable)}</small>
+                                ${account.last_error ? `<br><small>${escapeHtml(account.last_error)}</small>` : ''}
+                            </div>
+                            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                                <button onclick="validateStoredAccount('${account.id}')">Check</button>
+                                <button onclick="openCookieModal('${account.id}')">Re-login</button>
+                                <button onclick="removeStoredAccount('${account.id}')" style="background:#ef4444;">Remove</button>
+                            </div>
+                        </div>`;
+                }).join('');
+            } catch (e) {
+                listEl.innerHTML = `<p class="alert-error">Failed to load accounts: ${escapeHtml(e.message)}</p>`;
+            }
+        }
+
+        async function validateStoredAccount(accountId) {
+            await fetch(`/api/accounts/${accountId}/validate`, {method: 'POST'});
+            loadAccounts();
+            checkSession();
+        }
+
+        async function removeStoredAccount(accountId) {
+            if (!confirm('Remove this stored account session?')) return;
+            await fetch(`/api/accounts/${accountId}`, {method: 'DELETE'});
+            loadAccounts();
+            checkSession();
         }
 
         async function reloadCookiesInServer() {
@@ -580,6 +649,7 @@
                 const selects = ['book-facility', 'schedule-facility'];
                 selects.forEach(id => {
                     const select = document.getElementById(id);
+                    select.innerHTML = '<option value="">Select a facility...</option>';
                     facilities.forEach(fac => {
                         const option = document.createElement('option');
                         option.value = fac.id;
@@ -782,10 +852,16 @@
         // Cookie extraction modal and functions
         let currentSessionId = null;
         let pollInterval = null;
+        let editingAccountId = null;
+        let storedAccountsById = {};
 
-        function openCookieModal() {
+        function openCookieModal(accountId = null) {
             const modal = document.getElementById('cookie-modal');
             modal.classList.add('active');
+            editingAccountId = accountId;
+            const account = accountId ? storedAccountsById[accountId] : null;
+            document.getElementById('account-label').value = account ? account.label : '';
+            document.getElementById('cookie-modal-title').textContent = account ? '🔄 Re-login Account' : '➕ Add Account';
 
             // Reset modal state
             document.getElementById('cookie-actions').style.display = 'block';
@@ -807,13 +883,21 @@
             }
 
             currentSessionId = null;
+            editingAccountId = null;
         }
 
         async function startCookieExtraction() {
             try {
+                const label = document.getElementById('account-label').value.trim();
+                if (!label) {
+                    alert('Please enter an account label');
+                    return;
+                }
                 // Start extraction
                 const res = await fetch('/api/extract-cookies-start', {
-                    method: 'POST'
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({label, account_id: editingAccountId})
                 });
 
                 const data = await res.json();
@@ -864,6 +948,7 @@
                             closeCookieModal();
                             // Refresh session status
                             checkSession();
+                            loadAccounts();
                         }, 3000);
                     } else if (data.status === 'failed' || data.status === 'timeout') {
                         clearInterval(pollInterval);
@@ -971,6 +1056,7 @@
 
         // Initialize
         checkSession();
+        loadAccounts();
         loadFacilities();
     </script>
 </body>
