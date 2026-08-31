@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .account_pool import AccountLease, AccountPool, NoAvailableAccountError
 from .booking_http import FastBookingClient
@@ -36,6 +36,9 @@ class ScheduledBooking:
     account_id: Optional[str] = None
     court_name: Optional[str] = None
     participant_id: Optional[str] = None
+    batch_id: Optional[str] = None
+    batch_index: int = 1
+    batch_size: int = 1
 
 
 @dataclass
@@ -44,6 +47,7 @@ class PreparedScheduledBooking:
 
     booking: ScheduledBooking
     lease: AccountLease
+    preferred_facility_id: Optional[str] = None
 
 
 class BookingScheduler:
@@ -86,28 +90,85 @@ class BookingScheduler:
         facility_id: Optional[str] = None,
         execute_at: Optional[datetime] = None,
     ) -> ScheduledBooking:
-        if execute_at is None:
-            execute_at = target_date - timedelta(hours=self.BOOKING_WINDOW_HOURS)
-
-        booking = ScheduledBooking(
+        return self.schedule_batch(
             facility=facility,
             target_date=target_date,
             slot_time=slot_time,
-            execute_at=execute_at,
+            quantity=1,
             facility_id=facility_id,
-            status="pending",
-            booking_id=uuid.uuid4().hex,
-        )
-        self.scheduled_bookings.append(booking)
-        self._save_schedule()
+            execute_at=execute_at,
+        )[0]
+
+    def schedule_batch(
+        self,
+        facility: str,
+        target_date: datetime,
+        slot_time: str,
+        quantity: int,
+        facility_id: Optional[str] = None,
+        execute_at: Optional[datetime] = None,
+    ) -> List[ScheduledBooking]:
+        """Atomically schedule multiple attempts with distinct assigned accounts."""
+        if quantity < 1:
+            raise ValueError("Quantity must be at least 1")
+        if self._legacy_client and quantity > 1:
+            raise NoAvailableAccountError("Multiple bookings require an account pool")
+        if execute_at is None:
+            execute_at = target_date - timedelta(hours=self.BOOKING_WINDOW_HOURS)
+        # The web process and daemon have separate scheduler instances.
+        self._load_schedule()
+
+        batch_id = uuid.uuid4().hex
+        bookings = [
+            ScheduledBooking(
+                facility=facility,
+                target_date=target_date,
+                slot_time=slot_time,
+                execute_at=execute_at,
+                facility_id=facility_id,
+                status="pending",
+                booking_id=uuid.uuid4().hex,
+                batch_id=batch_id,
+                batch_index=index + 1,
+                batch_size=quantity,
+            )
+            for index in range(quantity)
+        ]
+
+        assignments = {}
+        if not self._legacy_client:
+            assignments = self.account_pool.assign_accounts(
+                target_date,
+                [booking.booking_id for booking in bookings],
+                batch_id=batch_id,
+            )
+            for booking in bookings:
+                booking.account_id = assignments[booking.booking_id]
+
+        try:
+            self.scheduled_bookings.extend(bookings)
+            self._save_schedule()
+        except Exception:
+            self.scheduled_bookings = [
+                existing for existing in self.scheduled_bookings
+                if existing.batch_id != batch_id
+            ]
+            if not self._legacy_client:
+                for booking in bookings:
+                    self.account_pool.release_assignment(
+                        booking.account_id, target_date, booking.booking_id
+                    )
+            raise
+
         logger.info(
-            "Scheduled booking: %s on %s at %s (executes at %s)",
+            "Scheduled %d booking(s): %s on %s at %s (executes at %s)",
+            quantity,
             facility,
             target_date.strftime("%Y-%m-%d"),
             slot_time,
             execute_at.strftime("%Y-%m-%d %H:%M:%S"),
         )
-        return booking
+        return bookings
 
     def reload_cookies(self, force: bool = False) -> bool:
         """Validate and refresh every stored account session."""
@@ -217,40 +278,118 @@ class BookingScheduler:
                 lease_id=booking.booking_id or uuid.uuid4().hex,
                 client=self._legacy_client,
             )
-        return self.account_pool.acquire(booking.target_date, validate=True)
+        if not booking.booking_id:
+            booking.booking_id = uuid.uuid4().hex
+        if not booking.batch_id:
+            booking.batch_id = booking.booking_id
+
+        previous_account_id = booking.account_id
+        if previous_account_id:
+            try:
+                return self.account_pool.activate_assignment(
+                    previous_account_id,
+                    booking.target_date,
+                    booking.booking_id,
+                    validate=True,
+                )
+            except NoAvailableAccountError:
+                self.account_pool.release_assignment(
+                    previous_account_id, booking.target_date, booking.booking_id
+                )
+
+        assignments = self.account_pool.assign_accounts(
+            booking.target_date,
+            [booking.booking_id],
+            batch_id=booking.batch_id,
+            exclude={previous_account_id} if previous_account_id else None,
+        )
+        booking.account_id = assignments[booking.booking_id]
+        return self.account_pool.activate_assignment(
+            booking.account_id,
+            booking.target_date,
+            booking.booking_id,
+            validate=True,
+        )
 
     def _prepare_bookings(
         self, bookings: List[ScheduledBooking]
     ) -> List[PreparedScheduledBooking]:
-        """Lease accounts and warm network state before the opening time."""
-        prepared = []
-        for booking in bookings:
-            lease = None
-            try:
-                lease = self._lease_account(booking)
-                booking.account_id = lease.account_id
-                booking.status = "executing"
+        """Validate accounts and warm network state concurrently before opening."""
+        if not bookings:
+            return []
+        with ThreadPoolExecutor(max_workers=len(bookings)) as executor:
+            prepared = [
+                item for item in executor.map(self._prepare_booking, bookings) if item
+            ]
+        return self._assign_preferred_courts(prepared)
 
-                cached_facility_id = lease.client.prepare_booking(
-                    facility=booking.facility,
-                    date=booking.target_date,
-                    facility_id=booking.facility_id,
-                )
-                if cached_facility_id:
-                    booking.facility_id = cached_facility_id
-                prepared.append(PreparedScheduledBooking(booking, lease))
-                logger.info("Prepared %s with account %s", booking.slot_time, lease.label)
-            except NoAvailableAccountError as exc:
-                booking.status = "failed"
-                booking.error = str(exc)
-                logger.error("Cannot prepare booking: %s", exc)
-            except Exception as exc:
-                if lease and not self._legacy_client:
-                    self.account_pool.release(lease)
-                booking.status = "failed"
-                booking.error = f"Preparation failed: {exc}"
-                logger.error("Booking preparation failed: %s", exc, exc_info=True)
-        return prepared
+    def _prepare_booking(
+        self, booking: ScheduledBooking
+    ) -> Optional[PreparedScheduledBooking]:
+        lease = None
+        try:
+            lease = self._lease_account(booking)
+            booking.account_id = lease.account_id
+            booking.status = "executing"
+
+            cached_facility_id = lease.client.prepare_booking(
+                facility=booking.facility,
+                date=booking.target_date,
+                facility_id=booking.facility_id,
+            )
+            if cached_facility_id:
+                booking.facility_id = cached_facility_id
+            logger.info("Prepared %s with account %s", booking.slot_time, lease.label)
+            return PreparedScheduledBooking(booking, lease)
+        except NoAvailableAccountError as exc:
+            booking.status = "failed"
+            booking.error = str(exc)
+            logger.error("Cannot prepare booking: %s", exc)
+        except Exception as exc:
+            if lease and not self._legacy_client:
+                self.account_pool.release(lease)
+            booking.status = "failed"
+            booking.error = f"Preparation failed: {exc}"
+            logger.error("Booking preparation failed: %s", exc, exc_info=True)
+        return None
+
+    def _assign_preferred_courts(
+        self, prepared: List[PreparedScheduledBooking]
+    ) -> List[PreparedScheduledBooking]:
+        """Give simultaneous attempts distinct first courts before the deadline."""
+        groups: Dict[Tuple, List[PreparedScheduledBooking]] = {}
+        for item in prepared:
+            booking = item.booking
+            key = (
+                booking.facility,
+                booking.target_date,
+                booking.slot_time,
+                booking.execute_at,
+            )
+            groups.setdefault(key, []).append(item)
+
+        ready = []
+        for group in groups.values():
+            sample = group[0]
+            getter = getattr(sample.lease.client, "get_prepared_facility_ids", None)
+            facility_ids = getter(sample.booking.facility) if getter else []
+            if not facility_ids:
+                ready.extend(group)
+                continue
+
+            for index, item in enumerate(group):
+                if index >= len(facility_ids):
+                    item.booking.status = "failed"
+                    item.booking.error = (
+                        f"Requested more courts than the facility provides "
+                        f"({len(facility_ids)})"
+                    )
+                    if not self._legacy_client:
+                        self.account_pool.release(item.lease)
+                    continue
+                item.preferred_facility_id = facility_ids[index]
+                ready.append(item)
+        return ready
 
     def _execute_prepared(self, prepared: PreparedScheduledBooking) -> None:
         booking = prepared.booking
@@ -273,6 +412,7 @@ class BookingScheduler:
                 date=booking.target_date,
                 slot_time=booking.slot_time,
                 facility_id=booking.facility_id,
+                preferred_facility_id=prepared.preferred_facility_id,
                 dry_run=False,
             )
             if success:
@@ -327,11 +467,36 @@ class BookingScheduler:
         if 0 <= index < len(self.scheduled_bookings):
             booking = self.scheduled_bookings[index]
             if booking.status == "pending":
+                if not self._legacy_client and booking.account_id and booking.booking_id:
+                    self.account_pool.release_assignment(
+                        booking.account_id, booking.target_date, booking.booking_id
+                    )
                 self.scheduled_bookings.pop(index)
                 self._save_schedule()
                 logger.info("Cancelled booking: %s - %s", booking.facility, booking.slot_time)
                 return True
         return False
+
+    def cancel_batch(self, batch_id: str) -> int:
+        """Cancel every pending booking in a batch and release its assignments."""
+        cancelled = []
+        remaining = []
+        for booking in self.scheduled_bookings:
+            if booking.batch_id == batch_id and booking.status == "pending":
+                cancelled.append(booking)
+            else:
+                remaining.append(booking)
+        if not cancelled:
+            return 0
+        if not self._legacy_client:
+            for booking in cancelled:
+                if booking.account_id and booking.booking_id:
+                    self.account_pool.release_assignment(
+                        booking.account_id, booking.target_date, booking.booking_id
+                    )
+        self.scheduled_bookings = remaining
+        self._save_schedule()
+        return len(cancelled)
 
     def _save_schedule(self) -> None:
         data = {
@@ -348,6 +513,9 @@ class BookingScheduler:
                     "account_id": booking.account_id,
                     "court_name": booking.court_name,
                     "participant_id": booking.participant_id,
+                    "batch_id": booking.batch_id,
+                    "batch_index": booking.batch_index,
+                    "batch_size": booking.batch_size,
                 }
                 for booking in self.scheduled_bookings
             ]
@@ -378,6 +546,9 @@ class BookingScheduler:
                     account_id=item.get("account_id"),
                     court_name=item.get("court_name"),
                     participant_id=item.get("participant_id"),
+                    batch_id=item.get("batch_id") or item.get("booking_id"),
+                    batch_index=item.get("batch_index", 1),
+                    batch_size=item.get("batch_size", 1),
                 )
                 for item in data.get("bookings", [])
             ]

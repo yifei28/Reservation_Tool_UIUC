@@ -29,6 +29,10 @@ class WebUiAccountTests(unittest.TestCase):
 
     def setUp(self):
         web_ui.SCHEDULER_PID_FILE.unlink(missing_ok=True)
+        for index in reversed(range(len(web_ui.scheduler.scheduled_bookings))):
+            web_ui.scheduler.cancel_booking(index)
+        web_ui.scheduler.scheduled_bookings = []
+        web_ui.scheduler._save_schedule()
         for account in web_ui.account_pool.list_accounts():
             web_ui.account_pool.remove_account(account['id'])
 
@@ -71,6 +75,46 @@ class WebUiAccountTests(unittest.TestCase):
         account = web_ui.account_pool.list_accounts('2026-09-01')[0]
         self.assertFalse(account['used_for_date'])
         self.assertFalse(account['leased_for_date'])
+        self.assertTrue(account['assigned_for_date'])
+
+    def test_multi_court_schedule_assigns_distinct_accounts_immediately(self):
+        web_ui.account_pool.store_cookies('one', {'session': 'one'})
+        web_ui.account_pool.store_cookies('two', {'session': 'two'})
+        with patch.object(web_ui, 'ensure_scheduler_running', return_value=True):
+            response = self.client.post('/api/schedule', json={
+                'facility': 'ARC_PICKLEBALL_BADMINTON',
+                'date': '2026-09-01',
+                'time': '5 - 6 PM',
+                'quantity': 2,
+                'execute_at': '2026-08-29T17:00',
+            })
+
+        data = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(data['assignments']), 2)
+        self.assertEqual(
+            len({item['account_id'] for item in data['assignments']}), 2
+        )
+        self.assertTrue(all(
+            account['assigned_for_date']
+            for account in web_ui.account_pool.list_accounts('2026-09-01')
+        ))
+
+    def test_multi_court_schedule_rejects_partial_assignment(self):
+        web_ui.account_pool.store_cookies('only', {'session': 'one'})
+        with patch.object(web_ui, 'ensure_scheduler_running', return_value=True):
+            response = self.client.post('/api/schedule', json={
+                'facility': 'ARC_PICKLEBALL_BADMINTON',
+                'date': '2026-09-01',
+                'time': '5 - 6 PM',
+                'quantity': 2,
+            })
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(web_ui.scheduler.scheduled_bookings, [])
+        self.assertFalse(
+            web_ui.account_pool.list_accounts('2026-09-01')[0]['assigned_for_date']
+        )
 
     def test_immediate_booking_response_includes_court_details(self):
         class ImmediateClient:

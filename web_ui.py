@@ -17,7 +17,7 @@ import threading
 import time
 
 from src.scheduler import BookingScheduler
-from src.account_pool import AccountPool, NoAvailableAccountError
+from src.account_pool import AccountInUseError, AccountPool, NoAvailableAccountError
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -178,7 +178,10 @@ def remove_account(account_id):
     """Remove one stored account session."""
     if not account_pool:
         return jsonify({'error': 'Account pool not initialized'}), 500
-    removed = account_pool.remove_account(account_id)
+    try:
+        removed = account_pool.remove_account(account_id)
+    except AccountInUseError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 409
     return jsonify({
         'success': removed,
         'message': 'Account removed' if removed else 'Account not found'
@@ -357,8 +360,12 @@ def schedule_booking():
     date_str = data.get('date')
     slot_time = data.get('time')
     execute_datetime_str = data.get('execute_at')  # Optional: custom execution time
+    quantity = data.get('quantity', 1)
 
     try:
+        quantity = int(quantity)
+        if quantity < 1 or quantity > 20:
+            return jsonify({'error': 'Quantity must be between 1 and 20'}), 400
         # Parse the date and time
         # Extract hour and AM/PM from slot_time (e.g., "6 - 7 PM" -> "6 PM", "11 AM - 12 PM" -> "11 AM")
         parts = slot_time.split()
@@ -378,21 +385,43 @@ def schedule_booking():
             execute_at = datetime.strptime(execute_datetime_str, "%Y-%m-%dT%H:%M")
 
         # Schedule the booking
-        booking = scheduler.schedule_booking(
+        bookings = scheduler.schedule_batch(
             facility=facility,
             target_date=target_date,
             slot_time=slot_time,
+            quantity=quantity,
             execute_at=execute_at
         )
 
         # Ensure scheduler daemon is running
         ensure_scheduler_running()
 
+        account_labels = {
+            account['id']: account['label']
+            for account in account_pool.list_accounts()
+        }
         return jsonify({
             'success': True,
-            'message': f'Booking scheduled for {booking.execute_at.strftime("%Y-%m-%d %H:%M:%S")}',
-            'execute_at': booking.execute_at.isoformat()
+            'message': (
+                f'{quantity} court booking(s) scheduled for '
+                f'{bookings[0].execute_at.strftime("%Y-%m-%d %H:%M:%S")}'
+            ),
+            'batch_id': bookings[0].batch_id,
+            'execute_at': bookings[0].execute_at.isoformat(),
+            'assignments': [
+                {
+                    'booking_id': booking.booking_id,
+                    'account_id': booking.account_id,
+                    'account_label': account_labels.get(booking.account_id),
+                    'batch_index': booking.batch_index,
+                }
+                for booking in bookings
+            ],
         })
+    except NoAvailableAccountError as e:
+        return jsonify({'error': str(e)}), 409
+    except (TypeError, ValueError) as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"Scheduling error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -400,7 +429,7 @@ def schedule_booking():
 
 @app.route('/api/scheduled-bookings')
 def list_scheduled():
-    """Get all scheduled bookings (newest to oldest, max 15)."""
+    """Get recent scheduled bookings, including complete multi-court batches."""
     if not scheduler:
         return jsonify({'error': 'Scheduler not initialized'}), 500
 
@@ -418,9 +447,9 @@ def list_scheduled():
         reverse=True
     )
 
-    # Take only the 15 most recent
+    # Keep enough rows to show complete multi-court batches.
     result = []
-    for original_index, booking in sorted_bookings[:15]:
+    for original_index, booking in sorted_bookings[:50]:
         time_until = (booking.execute_at - now).total_seconds()
         result.append({
             'index': original_index,  # Keep original index for cancellation
@@ -435,6 +464,9 @@ def list_scheduled():
             'court_id': booking.facility_id,
             'court_name': booking.court_name,
             'participant_id': booking.participant_id,
+            'batch_id': booking.batch_id,
+            'batch_index': booking.batch_index,
+            'batch_size': booking.batch_size,
             'hours_until': time_until / 3600 if time_until > 0 else 0
         })
 
@@ -456,6 +488,19 @@ def cancel_booking(index):
     except Exception as e:
         logger.error(f"Cancel error: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cancel-batch/<batch_id>', methods=['DELETE'])
+def cancel_batch(batch_id):
+    """Cancel all pending attempts in a multi-court batch."""
+    if not scheduler:
+        return jsonify({'error': 'Scheduler not initialized'}), 500
+    cancelled = scheduler.cancel_batch(batch_id)
+    return jsonify({
+        'success': cancelled > 0,
+        'cancelled': cancelled,
+        'message': f'Cancelled {cancelled} booking(s)' if cancelled else 'Batch not found',
+    }), 200 if cancelled else 404
 
 
 @app.route('/api/scheduler-status')

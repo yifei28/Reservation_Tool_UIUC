@@ -455,6 +455,14 @@
                 </div>
 
                 <div class="form-group">
+                    <label>Number of Courts</label>
+                    <input type="number" id="schedule-quantity" min="1" max="20" value="1">
+                    <small style="color: #6b7280; display: block; margin-top: 5px;">
+                        Each court requires one valid, unused account for the target date.
+                    </small>
+                </div>
+
+                <div class="form-group">
                     <label>
                         <input type="checkbox" id="custom-time-checkbox" onchange="toggleCustomTime()">
                         Use custom execution time (otherwise defaults to 72 hours before)
@@ -589,7 +597,8 @@
                 storedAccountsById = Object.fromEntries(accounts.map(account => [account.id, account]));
                 listEl.innerHTML = accounts.map(account => {
                     const unavailable = account.used_for_date ? 'used for selected date' :
-                        (account.leased_for_date ? 'reserved for selected date' : account.status);
+                        (account.leased_for_date ? 'executing for selected date' :
+                        (account.assigned_for_date ? 'assigned for selected date' : account.status));
                     const color = account.status === 'valid' ? '#10b981' :
                         (account.status === 'invalid' ? '#ef4444' : '#f59e0b');
                     return `
@@ -619,7 +628,9 @@
 
         async function removeStoredAccount(accountId) {
             if (!confirm('Remove this stored account session?')) return;
-            await fetch(`/api/accounts/${accountId}`, {method: 'DELETE'});
+            const res = await fetch(`/api/accounts/${accountId}`, {method: 'DELETE'});
+            const data = await res.json();
+            if (!res.ok) alert(data.error || 'Unable to remove account');
             loadAccounts();
             checkSession();
         }
@@ -763,15 +774,16 @@
             const date = document.getElementById('schedule-date').value;
             const time = document.getElementById('schedule-time').value;
             const executeAt = document.getElementById('schedule-execute-at').value;
+            const quantity = Number.parseInt(document.getElementById('schedule-quantity').value, 10);
             const resultEl = document.getElementById('schedule-result');
 
-            if (!facility || !date || !time) {
+            if (!facility || !date || !time || !Number.isInteger(quantity) || quantity < 1) {
                 alert('Please fill all required fields');
                 return;
             }
 
             try {
-                const payload = {facility, date, time};
+                const payload = {facility, date, time, quantity};
 
                 // Add custom execution time if provided
                 if (executeAt) {
@@ -787,7 +799,11 @@
                 const data = await res.json();
 
                 if (data.success) {
-                    resultEl.innerHTML = `<div class="alert alert-success">✅ ${data.message}</div>`;
+                    const assigned = (data.assignments || [])
+                        .map(item => escapeHtml(item.account_label || item.account_id))
+                        .join(', ');
+                    resultEl.innerHTML = `<div class="alert alert-success">✅ ${escapeHtml(data.message)}${assigned ? `<br><small>Assigned: ${assigned}</small>` : ''}</div>`;
+                    loadAccounts();
                 } else {
                     resultEl.innerHTML = `<div class="alert alert-error">❌ ${data.error || data.message}</div>`;
                 }
@@ -811,11 +827,18 @@
                 }
 
                 listEl.innerHTML = '';
+                const renderedBatches = new Set();
                 bookings.forEach(booking => {
                     const item = document.createElement('div');
                     item.className = 'booking-item';
+                    const firstInBatch = !renderedBatches.has(booking.batch_id);
+                    renderedBatches.add(booking.batch_id);
+                    const batchLabel = booking.batch_size > 1
+                        ? `<small><strong>Batch: ${booking.batch_size} courts · Attempt ${booking.batch_index}/${booking.batch_size}</strong></small><br>`
+                        : '';
                     item.innerHTML = `
                         <div class="booking-info">
+                            ${batchLabel}
                             <strong>${booking.facility}</strong> - ${booking.slot_time}<br>
                             <small>Target: ${booking.target_date} | Executes: ${booking.execute_at}</small><br>
                             ${booking.court_name || booking.court_id ? `<small>Court: ${escapeHtml(booking.court_name || booking.court_id)}</small><br>` : ''}
@@ -825,6 +848,9 @@
                         </div>
                         ${booking.status === 'pending' ?
                             `<button onclick="cancelBooking(${booking.index})">Cancel</button>` :
+                            ''}
+                        ${firstInBatch && booking.batch_size > 1 && booking.status === 'pending' ?
+                            `<button onclick="cancelBatch('${booking.batch_id}')" style="margin-left:6px;background:#ef4444;">Cancel Batch</button>` :
                             ''}
                     `;
                     listEl.appendChild(item);
@@ -850,6 +876,15 @@
             } catch (e) {
                 alert('Error: ' + e.message);
             }
+        }
+
+        async function cancelBatch(batchId) {
+            if (!confirm('Cancel every pending booking in this batch?')) return;
+            const res = await fetch(`/api/cancel-batch/${batchId}`, {method: 'DELETE'});
+            const data = await res.json();
+            if (!data.success) alert(data.error || data.message || 'Failed to cancel batch');
+            loadScheduledBookings();
+            loadAccounts();
         }
 
         // Cookie extraction modal and functions

@@ -27,6 +27,10 @@ class NoAvailableAccountError(RuntimeError):
     """Raised when no valid, unused account exists for a target date."""
 
 
+class AccountInUseError(RuntimeError):
+    """Raised when an assigned or leased account cannot be removed."""
+
+
 @dataclass
 class AccountLease:
     """An account reserved for one in-flight booking attempt."""
@@ -198,6 +202,12 @@ class AccountPool:
             registry = self._load_registry_unlocked()
             if account_id not in registry["accounts"]:
                 return False
+            for target_date, day_usage in registry["usage"].items():
+                use = day_usage.get(account_id)
+                if use and use.get("status") in {"assigned", "leased"}:
+                    raise AccountInUseError(
+                        f"Account is assigned to a pending booking for {target_date}"
+                    )
             del registry["accounts"][account_id]
             registry["account_order"] = [
                 item for item in registry["account_order"] if item != account_id
@@ -232,8 +242,147 @@ class AccountPool:
                     "last_error": account.get("last_error"),
                     "used_for_date": bool(use and use.get("status") == "used"),
                     "leased_for_date": bool(use and use.get("status") == "leased"),
+                    "assigned_for_date": bool(use and use.get("status") == "assigned"),
+                    "assigned_booking_id": use.get("booking_id") if use else None,
                 })
             return result
+
+    def assign_accounts(
+        self,
+        target_date: DateLike,
+        booking_ids: Iterable[str],
+        batch_id: Optional[str] = None,
+        exclude: Optional[Iterable[str]] = None,
+    ) -> Dict[str, str]:
+        """Atomically assign one distinct account to every booking ID."""
+        date_key = self._date_key(target_date)
+        booking_ids = list(booking_ids)
+        if not booking_ids or len(set(booking_ids)) != len(booking_ids):
+            raise ValueError("Booking IDs must be non-empty and unique")
+        excluded = set(exclude or [])
+
+        with self._locked():
+            registry = self._load_registry_unlocked()
+            day_usage = registry["usage"].setdefault(date_key, {})
+            candidates = []
+            for account_id in registry["account_order"]:
+                account = registry["accounts"].get(account_id)
+                if not account or account_id in excluded:
+                    continue
+                if account.get("status") == "invalid":
+                    continue
+                existing = day_usage.get(account_id)
+                if existing:
+                    leased_at = existing.get("leased_at", 0)
+                    stale = (
+                        existing.get("status") == "leased"
+                        and self.now_fn() - leased_at > self.LEASE_TTL_SECONDS
+                    )
+                    if not stale:
+                        continue
+                if self._session_path(account_id).exists():
+                    candidates.append(account_id)
+
+            if len(candidates) < len(booking_ids):
+                if not day_usage:
+                    registry["usage"].pop(date_key, None)
+                raise NoAvailableAccountError(
+                    f"Requested {len(booking_ids)} booking(s), but only "
+                    f"{len(candidates)} valid unused account(s) are available for {date_key}"
+                )
+
+            now = self.now_fn()
+            assignments = {}
+            for booking_id, account_id in zip(booking_ids, candidates):
+                day_usage[account_id] = {
+                    "status": "assigned",
+                    "booking_id": booking_id,
+                    "batch_id": batch_id,
+                    "assigned_at": now,
+                }
+                assignments[booking_id] = account_id
+            self._save_registry_unlocked(registry)
+            return assignments
+
+    def release_assignment(
+        self, account_id: str, target_date: DateLike, booking_id: str
+    ) -> bool:
+        """Release a pending schedule-time account assignment."""
+        date_key = self._date_key(target_date)
+        with self._locked():
+            registry = self._load_registry_unlocked()
+            day_usage = registry["usage"].get(date_key, {})
+            existing = day_usage.get(account_id)
+            if not existing or existing.get("status") != "assigned":
+                return False
+            if existing.get("booking_id") != booking_id:
+                return False
+            del day_usage[account_id]
+            if not day_usage:
+                registry["usage"].pop(date_key, None)
+            self._save_registry_unlocked(registry)
+            return True
+
+    def activate_assignment(
+        self,
+        account_id: str,
+        target_date: DateLike,
+        booking_id: str,
+        validate: bool = True,
+    ) -> AccountLease:
+        """Turn a persisted assignment into a validated in-flight lease."""
+        date_key = self._date_key(target_date)
+        with self._locked():
+            registry = self._load_registry_unlocked()
+            account = registry["accounts"].get(account_id)
+            day_usage = registry["usage"].get(date_key, {})
+            existing = day_usage.get(account_id)
+            if (
+                not account
+                or account.get("status") == "invalid"
+                or not existing
+                or existing.get("status") != "assigned"
+                or existing.get("booking_id") != booking_id
+            ):
+                raise NoAvailableAccountError(
+                    f"Assigned account is unavailable for booking {booking_id}"
+                )
+
+            lease_id = uuid.uuid4().hex
+            day_usage[account_id] = {
+                **existing,
+                "status": "leased",
+                "lease_id": lease_id,
+                "leased_at": self.now_fn(),
+            }
+            label = account.get("label", "Account")
+            self._save_registry_unlocked(registry)
+
+        try:
+            client = self.client_class(str(self._session_path(account_id)))
+        except Exception as exc:
+            self.mark_invalid(account_id, str(exc))
+            self._release_values(account_id, date_key, lease_id)
+            raise NoAvailableAccountError(str(exc)) from exc
+
+        if validate and not client.keep_alive():
+            error = getattr(client, "last_keep_alive_error", None) or "Session validation failed"
+            if error.startswith("Network error:"):
+                self._record_transient_error(account_id, error)
+            else:
+                self.mark_invalid(account_id, error)
+            self._release_values(account_id, date_key, lease_id)
+            raise NoAvailableAccountError(error)
+        if validate:
+            self._record_valid(account_id)
+
+        return AccountLease(
+            account_id=account_id,
+            label=label,
+            target_date=date_key,
+            lease_id=lease_id,
+            client=client,
+        )
 
     def _candidate_ids(self, target_date: str, excluded: Iterable[str]) -> List[str]:
         excluded = set(excluded)

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
-from src.account_pool import AccountPool, NoAvailableAccountError
+from src.account_pool import AccountInUseError, AccountPool, NoAvailableAccountError
 
 
 class FakeClient:
@@ -115,6 +115,57 @@ class AccountPoolTests(unittest.TestCase):
 
         self.assertEqual(set(acquired), ids)
         self.assertEqual(len(acquired), len(set(acquired)))
+
+    def test_batch_assignment_is_atomic_and_distinct(self):
+        ids = {self.add_account('one'), self.add_account('two')}
+        target = datetime(2026, 9, 1, 10)
+
+        assignments = self.pool.assign_accounts(
+            target, ['booking-one', 'booking-two'], batch_id='batch'
+        )
+
+        self.assertEqual(set(assignments.values()), ids)
+        accounts = self.pool.list_accounts(target)
+        self.assertTrue(all(account['assigned_for_date'] for account in accounts))
+        with self.assertRaises(NoAvailableAccountError):
+            self.pool.assign_accounts(target, ['booking-three'])
+
+    def test_insufficient_batch_assignment_creates_nothing(self):
+        self.add_account('only')
+        target = datetime(2026, 9, 1, 10)
+
+        with self.assertRaises(NoAvailableAccountError):
+            self.pool.assign_accounts(target, ['one', 'two'], batch_id='batch')
+
+        account = self.pool.list_accounts(target)[0]
+        self.assertFalse(account['assigned_for_date'])
+        self.assertFalse(account['leased_for_date'])
+
+    def test_concurrent_batch_assignments_do_not_overlap(self):
+        ids = {self.add_account(f'account-{index}') for index in range(4)}
+        barrier = threading.Barrier(2)
+
+        def assign_batch(index):
+            barrier.wait()
+            return self.pool.assign_accounts(
+                datetime(2026, 9, 1, 10),
+                [f'{index}-one', f'{index}-two'],
+                batch_id=f'batch-{index}',
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            batches = list(executor.map(assign_batch, range(2)))
+
+        assigned = [account_id for batch in batches for account_id in batch.values()]
+        self.assertEqual(set(assigned), ids)
+        self.assertEqual(len(assigned), len(set(assigned)))
+
+    def test_assigned_account_cannot_be_removed(self):
+        account_id = self.add_account('assigned')
+        self.pool.assign_accounts(datetime(2026, 9, 1), ['booking'])
+
+        with self.assertRaises(AccountInUseError):
+            self.pool.remove_account(account_id)
 
     def test_separate_processes_cannot_lease_the_same_account(self):
         ids = {self.add_account('process-one'), self.add_account('process-two')}

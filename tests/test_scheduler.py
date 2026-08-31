@@ -14,6 +14,9 @@ class TimedFakeClient:
     starts = []
     starts_lock = threading.Lock()
     result_by_account = {}
+    invalid_accounts = set()
+    multi_court = False
+    facility_ids = ['court-a', 'court-b', 'court-c']
 
     def __init__(self, session_file):
         self.session_file = Path(session_file)
@@ -22,10 +25,18 @@ class TimedFakeClient:
         self.last_booking_result = None
 
     def keep_alive(self):
-        return True
+        self.last_keep_alive_error = (
+            'Session validation failed' if self.name in self.invalid_accounts else None
+        )
+        return self.name not in self.invalid_accounts
 
     def prepare_booking(self, facility, date, facility_id=None):
+        if self.multi_court:
+            return None
         return facility_id or f'court-{self.name}'
+
+    def get_prepared_facility_ids(self, facility):
+        return list(self.facility_ids) if self.multi_court else []
 
     def book_slot(self, **kwargs):
         with self.starts_lock:
@@ -33,9 +44,10 @@ class TimedFakeClient:
         time.sleep(0.03)
         success = self.result_by_account.get(self.name, True)
         if success:
+            court_id = kwargs.get('preferred_facility_id') or kwargs.get('facility_id')
             self.last_booking_result = {
-                'facility_id': kwargs.get('facility_id'),
-                'court_name': f'Named {kwargs.get("facility_id")}',
+                'facility_id': court_id,
+                'court_name': f'Named {court_id}',
                 'participant_id': f'participant-{self.name}',
             }
         return success
@@ -47,6 +59,8 @@ class SchedulerMultiAccountTests(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         TimedFakeClient.starts = []
         TimedFakeClient.result_by_account = {}
+        TimedFakeClient.invalid_accounts = set()
+        TimedFakeClient.multi_court = False
         self.pool = AccountPool(
             accounts_dir=str(self.root / 'accounts'),
             legacy_session_file=None,
@@ -107,6 +121,81 @@ class SchedulerMultiAccountTests(unittest.TestCase):
         )
         self.assertEqual(reloaded.scheduled_bookings[0].court_name, 'Named court-one')
         self.assertEqual(reloaded.scheduled_bookings[1].participant_id, 'participant-two')
+
+    def test_batch_uses_persisted_accounts_and_distinct_preferred_courts(self):
+        TimedFakeClient.multi_court = True
+        execute_at = datetime.now() + timedelta(seconds=0.15)
+        bookings = self.scheduler.schedule_batch(
+            facility='ARC_PICKLEBALL_BADMINTON',
+            target_date=datetime(2026, 9, 1, 10),
+            slot_time='10 - 11 AM',
+            quantity=2,
+            execute_at=execute_at,
+        )
+        assigned_ids = [booking.account_id for booking in bookings]
+        self.assertEqual(len(set(assigned_ids)), 2)
+        reloaded = BookingScheduler(
+            account_pool=self.pool,
+            schedule_file=str(self.root / 'schedule.json'),
+            reload_signal_file=str(self.root / 'reload.signal'),
+        )
+        self.assertEqual(
+            [booking.account_id for booking in reloaded.scheduled_bookings],
+            assigned_ids,
+        )
+        self.assertEqual(
+            len({booking.batch_id for booking in reloaded.scheduled_bookings}), 1
+        )
+
+        original_assign = self.pool.assign_accounts
+        self.pool.assign_accounts = lambda *args, **kwargs: self.fail(
+            'account selection ran during preparation'
+        )
+        try:
+            prepared = self.scheduler._prepare_bookings(bookings)
+        finally:
+            self.pool.assign_accounts = original_assign
+
+        self.assertEqual(
+            [item.lease.account_id for item in prepared], assigned_ids
+        )
+        self.assertEqual(
+            len({item.preferred_facility_id for item in prepared}), 2
+        )
+        self.scheduler._execute_prepared_concurrently(prepared)
+        starts = [started for _, started in TimedFakeClient.starts]
+        self.assertLess(max(starts) - min(starts), 0.05)
+
+    def test_cancel_batch_releases_all_assignments(self):
+        bookings = self.scheduler.schedule_batch(
+            facility='ARC_MP1',
+            target_date=datetime(2026, 9, 1, 10),
+            slot_time='10 - 11 AM',
+            quantity=2,
+        )
+
+        self.assertEqual(self.scheduler.cancel_batch(bookings[0].batch_id), 2)
+        accounts = self.pool.list_accounts(datetime(2026, 9, 1))
+        self.assertTrue(all(not account['assigned_for_date'] for account in accounts))
+
+    def test_invalid_assigned_account_is_replaced_before_execution(self):
+        TimedFakeClient.invalid_accounts = {'one'}
+        bookings = self.scheduler.schedule_batch(
+            facility='ARC_MP1',
+            target_date=datetime(2026, 9, 1, 10),
+            slot_time='10 - 11 AM',
+            quantity=1,
+        )
+        self.assertEqual(
+            self.pool.list_accounts(datetime(2026, 9, 1))[0]['id'],
+            bookings[0].account_id,
+        )
+
+        prepared = self.scheduler._prepare_bookings(bookings)
+
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0].lease.label, 'two')
+        self.assertEqual(bookings[0].account_id, prepared[0].lease.account_id)
 
     def test_failed_booking_releases_account(self):
         TimedFakeClient.result_by_account['one'] = False

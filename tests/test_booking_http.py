@@ -97,6 +97,46 @@ class BookingHttpTests(unittest.TestCase):
             'participant_id': 'participant-123',
         })
 
+    def test_slot_matching_ignores_zero_minutes(self):
+        client = FastBookingClient(str(self.session_file))
+        slot = {
+            'apt_id': 'appointment',
+            'timeslot_id': 'timeslot',
+            'timeslot_instance_id': 'instance',
+            'time_text': '6:00 - 7:00 PM',
+        }
+
+        with patch.object(client, '_fetch_slots_for_court', return_value=[slot]):
+            result = client._attempt_booking_on_court(
+                product_id='product',
+                facility_id='court-id',
+                date=datetime(2026, 8, 30),
+                slot_time='6 - 7 PM',
+                dry_run=True,
+            )
+
+        self.assertEqual(result, 'court-id')
+
+    def test_preferred_court_is_tried_first_with_rotated_fallback(self):
+        client = FastBookingClient(str(self.session_file))
+        courts = ['court-a', 'court-b', 'court-c']
+        with patch.object(client, '_get_all_facility_ids', return_value=courts), \
+             patch.object(
+                 client,
+                 '_attempt_booking_on_court',
+                 side_effect=[None, 'court-c'],
+             ) as attempt:
+            success = client.book_slot(
+                facility='ARC_PICKLEBALL_BADMINTON',
+                date=datetime(2026, 9, 1),
+                slot_time='4 - 5 PM',
+                preferred_facility_id='court-b',
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(attempt.call_args_list[0].args[1], 'court-b')
+        self.assertEqual(attempt.call_args_list[1].args[1], 'court-c')
+
     def test_keep_alive_rejects_login_html_at_a_200_url(self):
         client = FastBookingClient(str(self.session_file))
         response = Mock(

@@ -7,6 +7,7 @@ import pickle
 import logging
 import requests
 import random
+import re
 import os
 import time
 import uuid
@@ -23,6 +24,12 @@ class FastBookingClient:
 
     BASE_URL = "https://active.illinois.edu"
     RESERVE_URL = f"{BASE_URL}/booking/reserve"
+
+    @staticmethod
+    def _normalize_slot_time(value: str) -> str:
+        """Normalize display-only differences without changing the slot meaning."""
+        normalized = re.sub(r'(?<=\d):00\b', '', value.upper())
+        return ' '.join(normalized.split())
 
     # Known facility product IDs and their court/facility IDs
     FACILITIES = {
@@ -452,6 +459,11 @@ class FastBookingClient:
             f"Court {facility_id[:8]}"
         )
 
+    def get_prepared_facility_ids(self, facility: str) -> List[str]:
+        """Return facility IDs cached during pre-deadline preparation."""
+        config = self.FACILITIES.get(facility) or {}
+        return list(self._facility_ids_cache.get(config.get("product_id"), []))
+
     def _select_initial_court(
         self,
         all_facility_ids: List[str],
@@ -636,8 +648,9 @@ class FastBookingClient:
 
         # Find matching slot
         target_slot = None
+        normalized_target = self._normalize_slot_time(slot_time)
         for slot in slots:
-            if slot['time_text'] == slot_time:
+            if self._normalize_slot_time(slot['time_text']) == normalized_target:
                 target_slot = slot
                 break
 
@@ -711,7 +724,8 @@ class FastBookingClient:
         slot_time: str,
         facility_id: Optional[str] = None,
         dry_run: bool = False,
-        court_selection: str = "random"
+        court_selection: str = "random",
+        preferred_facility_id: Optional[str] = None,
     ) -> bool:
         """
         Book a specific time slot using direct HTTP POST with multi-court support.
@@ -723,6 +737,7 @@ class FastBookingClient:
             facility_id: Optional facility ID (if None, will try all courts)
             dry_run: If True, don't actually submit the booking
             court_selection: Court selection strategy - "random", "first", or "cached"
+            preferred_facility_id: Court to try first while retaining fallback
 
         Returns:
             True if booking succeeded, False otherwise
@@ -773,11 +788,14 @@ class FastBookingClient:
         logger.info(f"Found {len(all_facility_ids)} courts, using '{court_selection}' strategy")
 
         # Select initial court to try
-        initial_court = self._select_initial_court(
-            all_facility_ids,
-            known_facility_id,
-            strategy=court_selection
-        )
+        if preferred_facility_id in all_facility_ids:
+            initial_court = preferred_facility_id
+        else:
+            initial_court = self._select_initial_court(
+                all_facility_ids,
+                known_facility_id,
+                strategy=court_selection
+            )
 
         # Try initial court first (fast path)
         result = self._attempt_booking_on_court(
@@ -793,10 +811,11 @@ class FastBookingClient:
         # Fast path failed - try remaining courts (fallback)
         logger.info(f"Initial court unavailable, trying remaining {len(all_facility_ids) - 1} courts...")
 
-        for court_id in all_facility_ids:
-            # Skip the court we already tried
-            if court_id == initial_court:
-                continue
+        initial_index = all_facility_ids.index(initial_court)
+        fallback_courts = (
+            all_facility_ids[initial_index + 1:] + all_facility_ids[:initial_index]
+        )
+        for court_id in fallback_courts:
 
             result = self._attempt_booking_on_court(
                 product_id, court_id, date, slot_time, dry_run
