@@ -28,8 +28,10 @@ python3 web_ui.py
 - **Fast** - Direct HTTP requests (~125ms vs 10+ seconds with browser)
 - **Background Daemon** - Runs continuously to execute scheduled bookings
 - **Multiple Accounts** - Rotates valid accounts so each account is used at most once per target date
+- **Multiple Courts** - Schedule several courts for the same time with one assigned account per attempt
 - **Automatic Session Refresh** - Keeps every stored account alive and persists renewed cookies
 - **Court Confirmation** - Shows the exact court and account used after a successful reservation
+- **Concurrent Execution** - Prepared workers submit simultaneous attempts at the release time
 
 ## Usage
 
@@ -41,8 +43,12 @@ python3 web_ui.py
 
 Open **http://localhost:5001** and use:
 - **Book Now** tab - Select facility, date, and time to book immediately
-- **Schedule Booking** tab - Schedule for 72 hours before your desired time
-- **My Scheduled Bookings** tab - View and cancel scheduled bookings
+- **Schedule Booking** tab - Select a court quantity and schedule for 72 hours before your desired time
+- **My Scheduled Bookings** tab - View assigned accounts, results, and cancel one attempt or a complete batch
+
+When a schedule is created, each attempt is immediately assigned a distinct
+credential. The request is all-or-nothing: scheduling two courts requires two
+valid accounts that are unused and unassigned for the target date.
 
 ### Command Line
 
@@ -62,10 +68,13 @@ python3 main.py cancel 0
 
 ### Run Scheduler Daemon
 
-To execute scheduled bookings automatically:
+The web server automatically starts or replaces the scheduler daemon, so no
+second command is needed when using `web_ui.py`.
+
+For headless use, run the daemon directly:
 
 ```bash
-python3 scheduler_daemon.py
+python3 run_scheduler.py
 ```
 
 Keep this running in the background (use `screen` or `tmux`).
@@ -73,18 +82,23 @@ Keep this running in the background (use `screen` or `tmux`).
 ## Supported Facilities
 
 - **ARC Courts**: ARC_MP1, ARC_MP2, ARC_MP4, ARC_MP5
+- **ARC Table Tennis**: ARC_MP3_TABLE_TENNIS_ONLY
 - **ARC Pickleball**: ARC_PICKLEBALL_BADMINTON (8 courts)
-- **ARC Other**: ARC_GYM_2_VOLLEYBALL_COURTS, ARC_RACQUETBALL_TABLE_TENNIS, ARC_SQUASH_COURTS
+- **ARC Other**: ARC_GYM_2_VOLLEYBALL_COURTS, ARC_RACQUETBALL_TABLE_TENNIS, ARC_REFLECTION_RECOVERY_ROOM, ARC_SQUASH_COURTS
 - **CRCE Courts**: CRCE_MP1, CRCE_MP2, CRCE_RACQUETBALL, CRCE_SQUASH_RB_MP_COURT
 - **Ice Arena**: ICE_ARENA_FREESTYLE_SKATING
 
 ## How It Works
 
 1. **Account Login** - Log in to each account once; cookies are stored separately under `.accounts/`
-2. **Account Leasing** - Before execution, reserve one valid account unused for the target date
-3. **Fast HTTP Booking** - Direct POST requests to `/booking/reserve` API endpoint
-4. **Scheduling** - Calculate the 72-hour window and save to `bookings_schedule.json`
-5. **Auto-Execution** - Warm each account connection early and release simultaneous requests concurrently
+2. **Schedule-Time Assignment** - Atomically assign one distinct credential to every requested court
+3. **Pre-Deadline Preparation** - About 60 seconds before execution, validate assigned sessions, warm connections, and select different preferred courts
+4. **Concurrent Booking** - Prepared worker threads submit requests simultaneously at the release time
+5. **Fallback and Results** - Each worker tries its preferred court first, falls back to other courts, and records the exact successful court and account
+
+Credential selection, session validation, court discovery, and worker creation
+happen before the exact deadline. The critical execution path contains only the
+slot lookup and reservation request.
 
 ## Troubleshooting
 
@@ -100,22 +114,30 @@ python3 extract_cookies.py --label "Account 1" --account-id ACCOUNT_ID
 
 **"Slot not available"**
 - Check the date is within 72 hours
-- Verify time format matches (e.g., "11 AM - 12 PM")
 - Slot might already be booked
+
+**"Requested N bookings, but only M accounts are available"**
+- Add or re-login additional accounts
+- Cancel another pending booking for the same target date to release its assignment
+- Reduce the requested number of courts
 
 ## Important Notes
 
 - Slots open **exactly 72 hours** before the time slot starts
-- You can only book **one slot per day** per facility type
+- Each account is used for at most **one successful reservation per target date**
+- Pending schedules reserve their assigned accounts until execution or cancellation
+- Failed attempts release their accounts; successful attempts mark them used for that date
+- An account assigned to a pending booking cannot be removed until that booking is cancelled
 - Sessions are refreshed automatically while valid; fully expired Microsoft sessions require re-login
 - A successfully used account is excluded only for that reservation's target date
-- Keep the scheduler daemon running for automated bookings
+- Keep either the web server or the standalone scheduler daemon running for automated bookings
 
 ## Files
 
 - `web_ui.py` - Web interface (Flask server)
 - `main.py` - CLI interface
-- `scheduler_daemon.py` - Background scheduler
+- `run_scheduler.py` - Scheduler daemon used by the web server
+- `scheduler_daemon.py` - Standalone scheduler with additional CLI options
 - `extract_cookies.py` - Cookie extraction script
 - `src/booking_http.py` - Fast HTTP booking client
 - `src/scheduler.py` - Scheduler logic
